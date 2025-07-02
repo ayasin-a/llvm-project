@@ -14,7 +14,7 @@
 def CycloneModel : SchedMachineModel {
   let IssueWidth = 6; // 6 micro-ops are dispatched per cycle.
   let MicroOpBufferSize = 192; // Based on the reorder buffer.
-  let LoopMicroOpBufferSize = 40; // for now to help partial unrolling in BasicTTIImplBase
+  let LoopMicroOpBufferSize = 150; // ==UP.PartialThreshold to help partial unrolling in BasicTTIImplBase
   let LoadLatency = 4; // Optimistic load latency.
   let MispredictPenalty = 16; // 14-19 cycles are typical.
   let CompleteModel = 1;
