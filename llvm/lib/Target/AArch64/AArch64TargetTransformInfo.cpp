@@ -4898,8 +4898,9 @@ void AArch64TTIImpl::getUnrollingPreferences(
   // Disable partial & runtime unrolling on -Os.
   UP.PartialOptSizeThreshold = 0;
 
-  // No need to unroll auto-vectorized loops
-  if (findStringMetadataForLoop(L, "llvm.loop.isvectorized"))
+  // No need to unroll auto-vectorized loops that were interleaved
+  if (findStringMetadataForLoop(L, "llvm.loop.isvectorized") &&
+      findStringMetadataForLoop(L, "llvm.loop.interleave.count"))
     return;
 
   // Scan the loop: don't unroll loops with calls as this could prevent
