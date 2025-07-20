@@ -219,6 +219,7 @@ class TargetTransformInfoImplBase;
 class TargetTransformInfo {
 public:
   enum PartialReductionExtendKind { PR_None, PR_SignExtend, PR_ZeroExtend };
+  static const unsigned DefaultUnrollPartialThreshold = 150;
 
   /// Get the kind of extension that an instruction represents.
   LLVM_ABI static PartialReductionExtendKind

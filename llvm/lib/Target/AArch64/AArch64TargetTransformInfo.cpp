@@ -4728,6 +4728,25 @@ static bool isLoopSizeWithinBudget(Loop *L, const AArch64TTIImpl &TTI,
   return true;
 }
 
+static int getLoopCost(Loop *L, const AArch64TTIImpl &TTI) {
+  // Estimate the size of the loop.
+  InstructionCost LoopCost = 0;
+
+  for (auto *BB : L->getBlocks()) {
+    for (auto &I : *BB) {
+      SmallVector<const Value *, 4> Operands(I.operand_values());
+      InstructionCost Cost =
+          TTI.getInstructionCost(&I, Operands, TTI::TCK_CodeSize);
+      // This can happen with intrinsics that don't currently have a cost model
+      // or for some operations that require SVE.
+      if (!Cost.isValid())
+        return -1;
+      LoopCost += Cost;
+    }
+  }
+  return LoopCost.getValue();
+}
+
 static bool shouldUnrollMultiExitLoop(Loop *L, ScalarEvolution &SE,
                                       const AArch64TTIImpl &TTI) {
   // Only consider loops with unknown trip counts for which we can determine
@@ -4762,12 +4781,21 @@ static bool shouldUnrollMultiExitLoop(Loop *L, ScalarEvolution &SE,
   return true;
 }
 
+#define UNDOFIX2 2
+
+#undef UNDOFIX
+// #define UNDOFIX 1 // ay
+//
+#define DOFIX3_BUDGET 8 // 9 // was 8
+#undef UNDOFIX3
+
 /// For Apple CPUs, we want to runtime-unroll loops to make better use if the
 /// OOO engine's wide instruction window and various predictors.
 static void
 getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
                                  TargetTransformInfo::UnrollingPreferences &UP,
                                  const AArch64TTIImpl &TTI) {
+  LLVM_DEBUG(dbgs() << " apple: isInnermost, #blocks<9\n");
   // Limit loops with structure that is highly likely to benefit from runtime
   // unrolling; that is we exclude outer loops and loops with many blocks (i.e.
   // likely with complex control flow). Note that the heuristics here may be
@@ -4776,19 +4804,27 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
   if (!L->isInnermost() || L->getNumBlocks() > 8)
     return;
 
+  LLVM_DEBUG(dbgs() << " apple: single exit block\n");
   // Loops with multiple exits are handled by common code.
   if (!L->getExitBlock())
     return;
 
   const SCEV *BTC = SE.getSymbolicMaxBackedgeTakenCount(L);
+  LLVM_DEBUG(dbgs() << " apple: tripcount is non-constant! BTC=" << *BTC
+                    << " SCEVConstant=" << isa<SCEVConstant>(BTC)
+                    << " SCEVCouldNotCompute" << isa<SCEVCouldNotCompute>(BTC)
+                    << " getSmallConstantMaxTripCount="
+                    << SE.getSmallConstantMaxTripCount(L) << "\n");
   if (isa<SCEVConstant>(BTC) || isa<SCEVCouldNotCompute>(BTC) ||
       (SE.getSmallConstantMaxTripCount(L) > 0 &&
        SE.getSmallConstantMaxTripCount(L) <= 32))
     return;
 
+  LLVM_DEBUG(dbgs() << " apple: !llvm.loop.isvectorized\n");
   if (findStringMetadataForLoop(L, "llvm.loop.isvectorized"))
     return;
 
+  LLVM_DEBUG(dbgs() << " apple: SymbolicMax == BackedgeTakenCount\n");
   if (SE.getSymbolicMaxBackedgeTakenCount(L) != SE.getBackedgeTakenCount(L))
     return;
 
@@ -4800,8 +4836,9 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
   BasicBlock *Header = L->getHeader();
   if (Header == L->getLoopLatch()) {
     // Estimate the size of the loop.
+    LLVM_DEBUG(dbgs() << " apple:L: <=8; Size=" << getLoopCost(L, TTI) << "\n");
     unsigned Size;
-    if (!isLoopSizeWithinBudget(L, TTI, 8, &Size))
+    if (!isLoopSizeWithinBudget(L, TTI, DOFIX3_BUDGET, &Size))
       return;
 
     SmallPtrSet<Value *, 8> LoadedValues;
@@ -4814,9 +4851,18 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
         const SCEV *PtrSCEV = SE.getSCEV(Ptr);
         if (SE.isLoopInvariant(PtrSCEV, L))
           continue;
-        if (isa<LoadInst>(&I))
+        if (isa<LoadInst>(&I)) {
           LoadedValues.insert(&I);
-        else
+#ifndef UNDOFIX3
+          for (auto *U : I.users()) {
+            LLVM_DEBUG(dbgs() << "\tLoadUsers: " << *U << "\n");
+            auto *Inst = dyn_cast<Instruction>(U);
+            if (!Inst || Inst->getParent() != BB)
+              continue;
+            LoadedValues.insert(U);
+          }
+#endif // UNDOFIX3
+        } else
           Stores.push_back(cast<StoreInst>(&I));
       }
     }
@@ -4827,6 +4873,8 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
     unsigned UC = 1;
     unsigned BestUC = 1;
     unsigned SizeWithBestUC = BestUC * Size;
+    LLVM_DEBUG(dbgs() << " apple:L:while SizeWithBestUC=" << SizeWithBestUC
+                      << "\n");
     while (UC <= 8) {
       unsigned SizeWithUC = UC * Size;
       if (SizeWithUC > 48)
@@ -4839,11 +4887,23 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
       UC++;
     }
 
+    //  SmallPtrSet<Value *, 8> LoadedValues;
+    //  SmallVector<StoreInst *> Stores;
+    for (auto l : LoadedValues) {
+      LLVM_DEBUG(dbgs() << "\tLoadValues: " << *l << "\n");
+    }
+    LLVM_DEBUG(dbgs() << " apple:L: BestUC=" << BestUC << "\n");
+    for (auto *SI : Stores) {
+      auto x = LoadedValues.contains(SI->getOperand(0));
+      LLVM_DEBUG(dbgs() << "  Lambda:apple> x=" << x << " SI=" << *SI
+                        << " Op0=" << *(SI->getOperand(0)) << "\n");
+    }
     if (BestUC == 1 || none_of(Stores, [&LoadedValues](StoreInst *SI) {
           return LoadedValues.contains(SI->getOperand(0));
         }))
       return;
 
+    LLVM_DEBUG(dbgs() << " apple:L: Did it!\n");
     UP.Runtime = true;
     UP.DefaultUnrollRuntimeCount = BestUC;
     return;
@@ -4851,6 +4911,7 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
 
   // Try to runtime-unroll loops with early-continues depending on loop-varying
   // loads; this helps with branch-prediction for the early-continues.
+  LLVM_DEBUG(dbgs() << " apple: early-continues\n");
   auto *Term = dyn_cast<BranchInst>(Header->getTerminator());
   auto *Latch = L->getLoopLatch();
   SmallVector<BasicBlock *> Preds(predecessors(Latch));
@@ -4859,6 +4920,7 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
       none_of(Preds, [L](BasicBlock *Pred) { return L->contains(Pred); }))
     return;
 
+  LLVM_DEBUG(dbgs() << " apple: DependsOnLoopLoad\n");
   std::function<bool(Instruction *, unsigned)> DependsOnLoopLoad =
       [&](Instruction *I, unsigned Depth) -> bool {
     if (isa<PHINode>(I) || L->isLoopInvariant(I) || Depth > 8)
@@ -4886,6 +4948,9 @@ void AArch64TTIImpl::getUnrollingPreferences(
     OptimizationRemarkEmitter *ORE) const {
   // Enable partial unrolling and runtime unrolling.
   BaseT::getUnrollingPreferences(L, SE, UP, ORE);
+  LLVM_DEBUG(dbgs() << "\tarm: TTI.UP.Partial=" << UP.Partial << "\n"); // ay
+  LLVM_DEBUG(dbgs() << "AArch64TTIImpl::getUnrollingPreferences for " << *L
+                    << " Loc=" << L->getLocStr() << "\n");
 
   UP.UpperBound = true;
 
@@ -4898,15 +4963,31 @@ void AArch64TTIImpl::getUnrollingPreferences(
   // Disable partial & runtime unrolling on -Os.
   UP.PartialOptSizeThreshold = 0;
 
-  // No need to unroll auto-vectorized loops that were interleaved
-  if (findStringMetadataForLoop(L, "llvm.loop.isvectorized") &&
-      findStringMetadataForLoop(L, "llvm.loop.interleave.count"))
+  // No need to unrolled auto-vectorized loops
+#ifndef UNDOFIX
+  if (findStringMetadataForLoop(L, "llvm.loop.isvectorized")
+      //       && findStringMetadataForLoop(L, "llvm.loop.interleave.count")
+  ) {
+    LLVM_DEBUG(
+        dbgs() << "\tarm: !unrolling loop.isvectorized" << " interleave="
+               << findStringMetadataForLoop(L, "llvm.loop.interleave.count")
+               << "\n"); // ay
     return;
-
+  }
+#endif
   // Scan the loop: don't unroll loops with calls as this could prevent
   // inlining.
   for (auto *BB : L->getBlocks()) {
     for (auto &I : *BB) {
+// LLVM_DEBUG(dbgs() << "isVectorTy=" << I.getType()->isVectorTy() << I <<
+// "\n");
+#ifdef UNDOFIX
+      if (I.getType()->isVectorTy()) {
+        LLVM_DEBUG(dbgs() << "cannot unroll vector instuctions, ex:" << I
+                          << "\n");
+        return;
+      }
+#endif
       if (isa<CallBase>(I)) {
         if (isa<CallInst>(I) || isa<InvokeInst>(I))
           if (const Function *F = cast<CallBase>(I).getCalledFunction())
@@ -4916,6 +4997,7 @@ void AArch64TTIImpl::getUnrollingPreferences(
       }
     }
   }
+  LLVM_DEBUG(dbgs() << "\tarm: pre ST->getProcFamily\n"); // ay
 
   // Apply subtarget-specific unrolling preferences.
   switch (ST->getProcFamily()) {
@@ -4923,7 +5005,20 @@ void AArch64TTIImpl::getUnrollingPreferences(
   case AArch64Subtarget::AppleA15:
   case AArch64Subtarget::AppleA16:
   case AArch64Subtarget::AppleM4:
+#ifndef UNDOFIX2
+    LLVM_DEBUG(dbgs() << "\tinit-: UP.PartialThreshold=" << UP.PartialThreshold
+                      << " DefaultUnrollPartialThreshold="
+                      << TargetTransformInfo::DefaultUnrollPartialThreshold
+                      << "\n"); // ay
+    initPartialUnrollingPreferences(TTI::DefaultUnrollPartialThreshold, UP);
+#endif
+    LLVM_DEBUG(dbgs() << "\tapl-: TTI.UP.Partial=" << UP.Partial
+                      << " UP.PartialThreshold=" << UP.PartialThreshold
+                      << "\n"); // ay
     getAppleRuntimeUnrollPreferences(L, SE, UP, *this);
+    LLVM_DEBUG(dbgs() << "\tapl+: TTI.UP.Partial=" << UP.Partial
+                      << " UP.PartialThreshold=" << UP.PartialThreshold
+                      << "\n"); // ay
     break;
   case AArch64Subtarget::Falkor:
     if (EnableFalkorHWPFUnrollFix)
@@ -4952,6 +5047,7 @@ void AArch64TTIImpl::getUnrollingPreferences(
   // unchanged
   if (ST->getProcFamily() != AArch64Subtarget::Generic &&
       !ST->getSchedModel().isOutOfOrder()) {
+    LLVM_DEBUG(dbgs() << "\tino: TTI.UP.Partial=" << UP.Partial << "\n"); // ay
     UP.Runtime = true;
     UP.Partial = true;
     UP.UnrollRemainder = true;

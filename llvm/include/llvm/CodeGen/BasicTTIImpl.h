@@ -683,6 +683,23 @@ public:
 
   int getInlinerVectorBonusPercent() const override { return 150; }
 
+  inline void
+  initPartialUnrollingPreferences(unsigned PartialThreshold,
+                                  TTI::UnrollingPreferences &UP) const {
+    // Enable runtime and partial unrolling up to the specified size.
+    // Enable using trip count upper bound to unroll loops.
+    UP.Partial = UP.Runtime = UP.UpperBound = true;
+    UP.PartialThreshold = PartialThreshold;
+
+    // Avoid unrolling when optimizing for size.
+    UP.OptSizeThreshold = 0;
+    UP.PartialOptSizeThreshold = 0;
+
+    // Set number of instructions optimized when "back edge"
+    // becomes "fall through" to default value of 2.
+    UP.BEInsns = 2;
+  }
+
   void getUnrollingPreferences(Loop *L, ScalarEvolution &SE,
                                TTI::UnrollingPreferences &UP,
                                OptimizationRemarkEmitter *ORE) const override {
@@ -741,18 +758,7 @@ public:
       }
     }
 
-    // Enable runtime and partial unrolling up to the specified size.
-    // Enable using trip count upper bound to unroll loops.
-    UP.Partial = UP.Runtime = UP.UpperBound = true;
-    UP.PartialThreshold = MaxOps;
-
-    // Avoid unrolling when optimizing for size.
-    UP.OptSizeThreshold = 0;
-    UP.PartialOptSizeThreshold = 0;
-
-    // Set number of instructions optimized when "back edge"
-    // becomes "fall through" to default value of 2.
-    UP.BEInsns = 2;
+    initPartialUnrollingPreferences(MaxOps, UP);
   }
 
   void getPeelingPreferences(Loop *L, ScalarEvolution &SE,

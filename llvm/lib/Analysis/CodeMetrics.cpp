@@ -210,7 +210,9 @@ void CodeMetrics::analyzeBasicBlock(
       }
     }
 
-    NumInsts += TTI.getInstructionCost(&I, TargetTransformInfo::TCK_CodeSize);
+    auto c = TTI.getInstructionCost(&I, TargetTransformInfo::TCK_CodeSize);
+    LLVM_DEBUG(dbgs() << "\tcost=" << c << I << "\n"); // ay
+    NumInsts += c;
   }
 
   if (isa<ReturnInst>(BB->getTerminator()))

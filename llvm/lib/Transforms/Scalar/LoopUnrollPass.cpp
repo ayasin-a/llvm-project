@@ -201,7 +201,7 @@ TargetTransformInfo::UnrollingPreferences llvm::gatherUnrollingPreferences(
       OptLevel > 2 ? UnrollThresholdAggressive : UnrollThresholdDefault;
   UP.MaxPercentThresholdBoost = 400;
   UP.OptSizeThreshold = UnrollOptSizeThreshold;
-  UP.PartialThreshold = 150;
+  UP.PartialThreshold = TargetTransformInfo::DefaultUnrollPartialThreshold;
   UP.PartialOptSizeThreshold = UnrollOptSizeThreshold;
   UP.Count = 0;
   UP.DefaultUnrollRuntimeCount = 8;
@@ -278,6 +278,9 @@ TargetTransformInfo::UnrollingPreferences llvm::gatherUnrollingPreferences(
     UP.UpperBound = *UserUpperBound;
   if (UserFullUnrollMaxCount)
     UP.FullUnrollMaxCount = *UserFullUnrollMaxCount;
+  LLVM_DEBUG(dbgs() << "\tgather: TTI.UP.Partial=" << UP.Partial
+                    << " UP.PartialThreshold=" << UP.PartialThreshold
+                    << "\n"); // ay
 
   return UP;
 }
@@ -1220,6 +1223,8 @@ tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI, ScalarEvolution &SE,
       ProvidedFullUnrollMaxCount);
   TargetTransformInfo::PeelingPreferences PP = gatherPeelingPreferences(
       L, SE, TTI, ProvidedAllowPeeling, ProvidedAllowProfileBasedPeeling, true);
+  LLVM_DEBUG(dbgs() << "  UP.Partial=" << UP.Partial
+                    << " UP.Runtime=" << UP.Runtime << "\n");
 
   // Exit early if unrolling is disabled. For OptForSize, we pick the loop size
   // as threshold later on.
@@ -1292,6 +1297,8 @@ tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI, ScalarEvolution &SE,
     MaxOrZero = SE.isBackedgeTakenCountMaxOrZero(L);
   }
 
+  LLVM_DEBUG(dbgs() << "  CompletelyUnrolled/computeUnrollCount: " << UP.Count
+                    << " == " << SE.getSmallConstantMaxTripCount(L) << "\n");
   // computeUnrollCount() decides whether it is beneficial to use upper bound to
   // fully unroll the loop.
   bool UseUpperBound = false;
@@ -1356,6 +1363,8 @@ tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI, ScalarEvolution &SE,
   ULO.Heart = getLoopConvergenceHeart(L);
   ULO.SCEVExpansionBudget = UP.SCEVExpansionBudget;
   ULO.RuntimeUnrollMultiExit = UP.RuntimeUnrollMultiExit;
+  LLVM_DEBUG(dbgs() << "  CompletelyUnrolled/UnrollLoop: " << ULO.Count
+                    << " == " << SE.getSmallConstantMaxTripCount(L) << "\n");
   LoopUnrollResult UnrollResult = UnrollLoop(
       L, ULO, LI, &SE, &DT, &AC, &TTI, &ORE, PreserveLCSSA, &RemainderLoop, AA);
   if (UnrollResult == LoopUnrollResult::Unmodified)
