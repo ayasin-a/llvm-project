@@ -240,6 +240,9 @@ LLVM_ABI FunctionPass *createDefaultPBQPRegisterAllocator();
 LLVM_ABI extern char &PrologEpilogCodeInserterID;
 LLVM_ABI MachineFunctionPass *createPrologEpilogInserterPass();
 
+LLVM_ABI MachineFunctionPass *createAsmAnalysis();
+LLVM_ABI extern char &AsmAnalysisID;
+
 /// ExpandPostRAPseudos - This pass expands pseudo instructions after
 /// register allocation.
 LLVM_ABI extern char &ExpandPostRAPseudosID;
