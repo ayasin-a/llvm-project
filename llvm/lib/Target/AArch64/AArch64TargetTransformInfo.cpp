@@ -5027,18 +5027,22 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
 
     // Try to find an unroll count that maximizes the use of the instruction
     // window, i.e. trying to fetch as many instructions per cycle as possible.
+    const unsigned LoopingInsts = L->getBackEdgeInstructions().size();
+    auto unrolledSize = [&](unsigned UnrollCount) -> unsigned {
+      return (UnrollCount - 1) * (Size - LoopingInsts) + Size;
+    };
     unsigned MaxInstsPerLine = 16;
     unsigned UC = 1;
     unsigned BestUC = 1;
     unsigned SizeWithBestUC = BestUC * Size;
     while (UC <= 8) {
-      unsigned SizeWithUC = UC * Size;
+      unsigned SizeWithUC = unrolledSize(UC);
       if (SizeWithUC > 48)
         break;
       if ((SizeWithUC % MaxInstsPerLine) == 0 ||
           (SizeWithBestUC % MaxInstsPerLine) < (SizeWithUC % MaxInstsPerLine)) {
         BestUC = UC;
-        SizeWithBestUC = BestUC * Size;
+        SizeWithBestUC = unrolledSize(BestUC);
       }
       UC++;
     }

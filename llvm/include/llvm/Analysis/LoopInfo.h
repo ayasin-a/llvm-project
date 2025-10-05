@@ -107,6 +107,19 @@ public:
   /// Get the latch condition instruction.
   ICmpInst *getLatchCmpInst() const;
 
+  /// Returns a list of instructions that end with the back-edge branch of this
+  /// loop, the compare instruction prior to that conditional branch, and
+  /// optionally instructions dealing with updating the loop induction variable.
+  ///
+  /// The returned list may include (in this order):
+  /// 1. The induction variable update instruction (if found)
+  /// 2. The comparison instruction (if found)
+  /// 3. The conditional branch instruction (back-edge branch)
+  ///
+  /// Returns an empty list if the loop doesn't have a unique latch block or
+  /// the latch doesn't end with a conditional branch.
+  SmallVector<Instruction *, 4> getBackEdgeInstructions() const;
+
   /// Obtain the unique incoming and back edge. Return false if they are
   /// non-unique or the loop is dead; otherwise, return true.
   bool getIncomingAndBackEdge(BasicBlock *&Incoming,

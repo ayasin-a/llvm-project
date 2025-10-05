@@ -181,6 +181,43 @@ ICmpInst *Loop::getLatchCmpInst() const {
   return nullptr;
 }
 
+SmallVector<Instruction *, 4> Loop::getBackEdgeInstructions() const {
+  SmallVector<Instruction *, 4> Instructions;
+
+  // Get the latch block (contains the back edge to the header)
+  BasicBlock *Latch = getLoopLatch();
+  if (!Latch)
+    return Instructions;
+
+  // Get the terminator - should be a conditional branch for a back edge
+  BranchInst *BI = dyn_cast<BranchInst>(Latch->getTerminator());
+  if (!BI || !BI->isConditional())
+    return Instructions;
+
+  // Try to find the induction variable update instruction
+  // First, check for a canonical induction variable
+  if (PHINode *IndVar = getCanonicalInductionVariable()) {
+    BasicBlock *Incoming = nullptr, *Backedge = nullptr;
+    if (getIncomingAndBackEdge(Incoming, Backedge)) {
+      // Get the value coming from the backedge (the step instruction)
+      if (Instruction *StepInst =
+              dyn_cast<Instruction>(IndVar->getIncomingValueForBlock(Backedge))) {
+        Instructions.push_back(StepInst);
+      }
+    }
+  }
+
+  // Try to get the comparison instruction that feeds the branch
+  if (ICmpInst *Cmp = dyn_cast<ICmpInst>(BI->getCondition())) {
+    Instructions.push_back(Cmp);
+  }
+
+  // Add the branch instruction itself
+  Instructions.push_back(BI);
+
+  return Instructions;
+}
+
 /// Return the final value of the loop induction variable if found.
 static Value *findFinalIVValue(const Loop &L, const PHINode &IndVar,
                                const Instruction &StepInst) {
