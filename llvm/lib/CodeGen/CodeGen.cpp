@@ -86,6 +86,7 @@ void llvm::initializeCodeGen(PassRegistry &Registry) {
   initializeMachineBlockHashInfoPass(Registry);
   initializeMachineBlockPlacementLegacyPass(Registry);
   initializeMachineBlockPlacementStatsLegacyPass(Registry);
+  initializeLoopUnrollASMPass(Registry);
   initializeMachineBranchProbabilityInfoWrapperPassPass(Registry);
   initializeMachineCFGPrinterPass(Registry);
   initializeMachineCSELegacyPass(Registry);

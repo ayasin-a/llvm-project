@@ -197,6 +197,7 @@ LLVM_ABI void
 initializeMachineBlockFrequencyInfoWrapperPassPass(PassRegistry &);
 LLVM_ABI void initializeMachineBlockPlacementLegacyPass(PassRegistry &);
 LLVM_ABI void initializeMachineBlockPlacementStatsLegacyPass(PassRegistry &);
+LLVM_ABI void initializeLoopUnrollASMPass(PassRegistry &);
 LLVM_ABI void
 initializeMachineBranchProbabilityInfoWrapperPassPass(PassRegistry &);
 LLVM_ABI void initializeMachineCFGPrinterPass(PassRegistry &);

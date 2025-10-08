@@ -335,6 +335,13 @@ LLVM_ABI extern char &MachineBlockPlacementID;
 /// information.
 LLVM_ABI extern char &MachineBlockPlacementStatsID;
 
+/// LoopUnrollASM - This pass traverses machine loops and modifies assembly
+/// for tight loops.
+LLVM_ABI extern char &LoopUnrollASMID;
+
+/// createLoopUnrollASMPass - This pass modifies assembly for tight loops.
+LLVM_ABI FunctionPass *createLoopUnrollASMPass();
+
 /// GCLowering Pass - Used by gc.root to perform its default lowering
 /// operations.
 LLVM_ABI FunctionPass *createGCLoweringPass();
