@@ -10,6 +10,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstr.h"
@@ -24,18 +26,21 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/ADT/Statistic.h"
+#include <cassert>
 
 using namespace llvm;
 
 #define DEBUG_TYPE "loop-unroll-asm"
 
-STATISTIC(NumLoopsUnrolledASM, "Number of simple short loops detected by LoopUnrollASM");
+STATISTIC(NumLoopsDetectedASM,
+          "Number of tight loops detected by LoopUnrollASM");
+STATISTIC(NumLoopsUnrolledASM,
+          "Number of tight loops unrolled by LoopUnrollASM");
 
 static cl::opt<unsigned> LoopUnrollASMMaxInsts(
     "loop-unroll-asm-max-insts",
     cl::desc("Maximum number of instructions in a loop for LoopUnrollASM to process"),
-    cl::init(50), cl::Hidden);
+    cl::init(46), cl::Hidden);
 
 namespace {
 class LoopUnrollASM : public MachineFunctionPass {
@@ -59,6 +64,7 @@ private:
   bool processLoop(MachineLoop *Loop, MachineFunction &MF);
   bool processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                         MachineBasicBlock *Header, unsigned InstrCount);
+  void duplicateLoopBody(MachineBasicBlock *Header, unsigned UnrollFactor);
   unsigned countLoopInstructions(MachineLoop *Loop);
 };
 } // end anonymous namespace
@@ -139,10 +145,8 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 // - Are single basic-block loops (Head == Latch)
 // - Have a conditional branch as the backedge
 bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
-                                      MachineBasicBlock *Header,
-                                      unsigned InstrCount) {
-  const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
-
+                                     MachineBasicBlock *Header,
+                                     unsigned InstrCount) {
   // Get debug location information
   DebugLoc DL;
   for (MachineInstr &MI : *Header) {
@@ -152,7 +156,6 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     }
   }
 
-  // Print debug information
   LLVM_DEBUG({
     dbgs() << "Found qualifying loop in function " << MF.getName() << "\n";
     if (DL) {
@@ -185,10 +188,19 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
   LLVM_DEBUG(dbgs() << "  Inserted NOP at the beginning of the loop\n");
 #endif // if 0
 
-  // Update statistics
-  ++NumLoopsUnrolledASM;
+  ++NumLoopsDetectedASM;
 
-  return true;
+  const unsigned MachineWidth = 10;
+  unsigned bubbles = InstrCount % MachineWidth;
+  bubbles = bubbles ? MachineWidth - bubbles : 0;
+  if (bubbles > MachineWidth / 3) {
+    // Duplicate the loop body with unroll factor of 2
+    duplicateLoopBody(Header, 2);
+    ++NumLoopsUnrolledASM;
+    return true;
+  }
+
+  return false;
 }
 
 unsigned LoopUnrollASM::countLoopInstructions(MachineLoop *Loop) {
@@ -202,6 +214,100 @@ unsigned LoopUnrollASM::countLoopInstructions(MachineLoop *Loop) {
     }
   }
   return Count;
+}
+
+void LoopUnrollASM::duplicateLoopBody(MachineBasicBlock *Header,
+                                      unsigned UnrollFactor) {
+  assert (UnrollFactor > 1);
+
+  const TargetInstrInfo *TII =
+      Header->getParent()->getSubtarget().getInstrInfo();
+
+  // Find the exit block (the fallthrough successor that's not the loop header)
+  MachineBasicBlock *ExitBlock = nullptr;
+  for (MachineBasicBlock *Succ : Header->successors()) {
+    if (Succ != Header) {
+      ExitBlock = Succ;
+      break;
+    }
+  }
+
+  if (!ExitBlock) {
+    LLVM_DEBUG(dbgs() << "  Warning: Could not find loop exit block\n");
+    return;
+  }
+
+  // Collect all instructions to duplicate (excluding the final branch)
+  SmallVector<MachineInstr *, 16> InstsToClone;
+  MachineInstr *OrigBranch = nullptr;
+
+  for (MachineInstr &MI : *Header) {
+    // Skip PHI nodes and debug instructions
+    if (!MI.isPHI() && !MI.isDebugInstr()) {
+      if (MI.isTerminator()) {
+        OrigBranch = &MI;
+        break; // Don't add the branch to InstsToClone
+      } else {
+        InstsToClone.push_back(&MI);
+      }
+    }
+  }
+
+  assert(OrigBranch && OrigBranch->isConditionalBranch() && "Warning: No conditional branch found\n");
+
+  // Analyze the original branch to extract condition
+  SmallVector<MachineOperand, 4> Cond;
+  MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
+
+  if (TII->analyzeBranch(*Header, TBB, FBB, Cond)) {
+    LLVM_DEBUG(dbgs() << "  Warning: Could not analyze branch\n");
+    return;
+  }
+
+  // Remove the original branch - we'll add new ones
+  TII->removeBranch(*Header);
+
+  // Now we need to insert UnrollFactor copies of the body with appropriate
+  // branches. The original body instructions are still in place, so we start
+  // from i=1
+  for (unsigned i = 0; i < UnrollFactor; ++i) {
+    // For i=0, we use the original instructions that are already there
+    // For i>0, we clone the body instructions
+    if (i > 0) {
+      for (MachineInstr *MI : InstsToClone) {
+        MachineInstr *ClonedMI = Header->getParent()->CloneMachineInstr(MI);
+        Header->push_back(ClonedMI);
+      }
+    }
+
+    // Insert appropriate branch after each body copy
+    if (i < UnrollFactor - 1) {
+      // For all but the last iteration, insert inverted conditional branch to
+      // exit
+      SmallVector<MachineOperand, 4> InvertedCond(Cond);
+      bool Inverted = TII->reverseBranchCondition(InvertedCond);
+      assert(!Inverted && "Unable to invert branch condition for conditional branch");
+      (void)Inverted; // Silence unused variable warning in release builds
+
+      // Insert branch: if inverted condition true, go to ExitBlock, else fall
+      // through
+      TII->insertBranch(*Header, ExitBlock, nullptr, InvertedCond,
+                        OrigBranch->getDebugLoc());
+    } else {
+      // For the last iteration, keep the original branch
+      TII->insertBranch(*Header, TBB, FBB, Cond, OrigBranch->getDebugLoc());
+    }
+  }
+
+  LLVM_DEBUG({
+    dbgs() << "  Duplicated loop by unroll factor " << UnrollFactor
+           << "\n";
+    dbgs() << "  Exit block: BB#" << ExitBlock->getNumber() << "\n";
+    dbgs() << "  New instruction count: " << Header->size() << "\n";
+    dbgs() << "  Expected: "
+           << (InstsToClone.size() * UnrollFactor + UnrollFactor) << " (body * "
+           << UnrollFactor << " + " << UnrollFactor << " branches)\n";
+  });
 }
 
 FunctionPass *llvm::createLoopUnrollASMPass() {
