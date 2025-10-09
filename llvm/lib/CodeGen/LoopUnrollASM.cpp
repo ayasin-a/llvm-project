@@ -54,7 +54,7 @@ public:
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<MachineLoopInfoWrapperPass>();
-    AU.addPreserved<MachineLoopInfoWrapperPass>();
+    // Don't preserve MachineLoopInfo since we're changing loop structure
     MachineFunctionPass::getAnalysisUsage(AU);
   }
 
@@ -110,23 +110,32 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   if (!Header || !Latch || Header != Latch)
     return Changed;
 
-  // Check if the backedge is a conditional branch
-  MachineBasicBlock::iterator LastI = Header->getLastNonDebugInstr();
-
-  if (LastI == Header->end()) {
-    return Changed;
+  // Check if the loop has a conditional branch back edge
+  // Note: The conditional branch might not be the last instruction if there's
+  // also an unconditional branch to the exit block
+  bool hasConditionalBranch = false;
+  for (auto I = Header->rbegin(); I != Header->rend(); ++I) {
+    if (I->isDebugInstr())
+      continue;
+    if (I->isConditionalBranch()) {
+      // Check if this conditional branch targets the loop header
+      for (MachineOperand &MO : I->operands()) {
+        if (MO.isMBB() && MO.getMBB() == Header) {
+          hasConditionalBranch = true;
+          break;
+        }
+      }
+      if (hasConditionalBranch)
+        break;
+    }
+    // Stop looking after we've seen all terminators
+    if (!I->isTerminator())
+      break;
   }
 
-  if (!LastI->isConditionalBranch()) {
-    LLVM_DEBUG(dbgs() << "  Loop backedge is not a conditional branch");
-    if (LastI->isBranch()) {
-      LLVM_DEBUG(dbgs() << " (unconditional branch)");
-    } else if (LastI->isTerminator()) {
-      LLVM_DEBUG(dbgs() << " (non-branch terminator)");
-    } else {
-      LLVM_DEBUG(dbgs() << " (not a terminator)");
-    }
-    LLVM_DEBUG(dbgs() << "\n");
+  if (!hasConditionalBranch) {
+    LLVM_DEBUG(
+        dbgs() << "  Loop does not have a conditional branch back to header\n");
     return Changed;
   }
 
@@ -220,8 +229,8 @@ void LoopUnrollASM::duplicateLoopBody(MachineBasicBlock *Header,
                                       unsigned UnrollFactor) {
   assert (UnrollFactor > 1);
 
-  const TargetInstrInfo *TII =
-      Header->getParent()->getSubtarget().getInstrInfo();
+  MachineFunction *MF = Header->getParent();
+  const TargetInstrInfo *TII = MF->getSubtarget().getInstrInfo();
 
   // Find the exit block (the fallthrough successor that's not the loop header)
   MachineBasicBlock *ExitBlock = nullptr;
@@ -237,7 +246,7 @@ void LoopUnrollASM::duplicateLoopBody(MachineBasicBlock *Header,
     return;
   }
 
-  // Collect all instructions to duplicate (excluding the final branch)
+  // Collect all non-terminator instructions to duplicate
   SmallVector<MachineInstr *, 16> InstsToClone;
   MachineInstr *OrigBranch = nullptr;
 
@@ -245,15 +254,24 @@ void LoopUnrollASM::duplicateLoopBody(MachineBasicBlock *Header,
     // Skip PHI nodes and debug instructions
     if (!MI.isPHI() && !MI.isDebugInstr()) {
       if (MI.isTerminator()) {
-        OrigBranch = &MI;
-        break; // Don't add the branch to InstsToClone
+        // Find the conditional branch that goes back to the header
+        if (MI.isConditionalBranch()) {
+          for (MachineOperand &MO : MI.operands()) {
+            if (MO.isMBB() && MO.getMBB() == Header) {
+              OrigBranch = &MI;
+              break;
+            }
+          }
+        }
+        // Don't add any terminators to InstsToClone
       } else {
         InstsToClone.push_back(&MI);
       }
     }
   }
 
-  assert(OrigBranch && OrigBranch->isConditionalBranch() && "Warning: No conditional branch found\n");
+  assert(OrigBranch && OrigBranch->isConditionalBranch() &&
+         "No conditional branch found in loop");
 
   // Analyze the original branch to extract condition
   SmallVector<MachineOperand, 4> Cond;
@@ -264,49 +282,116 @@ void LoopUnrollASM::duplicateLoopBody(MachineBasicBlock *Header,
     return;
   }
 
-  // Remove the original branch - we'll add new ones
+  LLVM_DEBUG(dbgs() << "  Original loop body has " << InstsToClone.size()
+                    << " non-branch instructions\n");
+
+  // We need to create new basic blocks for proper control flow
+  // The structure will be:
+  // Header -> Body1 -> Body2 -> ... -> BodyN -> Header (loop back)
+  //    |        |        |              |
+  //    v        v        v              v
+  //  Exit    Exit      Exit           Exit
+
+  // Create UnrollFactor-1 new basic blocks (we reuse Header for the first
+  // iteration)
+  SmallVector<MachineBasicBlock *, 4> NewBlocks;
+  MachineBasicBlock *PrevBlock = Header;
+
+  for (unsigned i = 1; i < UnrollFactor; ++i) {
+    MachineBasicBlock *NewBB = MF->CreateMachineBasicBlock();
+    MF->insert(++MachineFunction::iterator(PrevBlock), NewBB);
+    NewBlocks.push_back(NewBB);
+    PrevBlock = NewBB;
+  }
+
+  // Remove the original branch from Header - we'll add new ones
   TII->removeBranch(*Header);
 
-  // Now we need to insert UnrollFactor copies of the body with appropriate
-  // branches. The original body instructions are still in place, so we start
-  // from i=1
+  // Now set up each block with its body and appropriate branch
+  MachineBasicBlock *CurrentBlock = Header;
+
   for (unsigned i = 0; i < UnrollFactor; ++i) {
-    // For i=0, we use the original instructions that are already there
-    // For i>0, we clone the body instructions
+    // For blocks after the first, copy the body instructions
     if (i > 0) {
+      CurrentBlock = NewBlocks[i - 1];
+
+      // Clone body instructions into the new block
       for (MachineInstr *MI : InstsToClone) {
-        MachineInstr *ClonedMI = Header->getParent()->CloneMachineInstr(MI);
-        Header->push_back(ClonedMI);
+        MachineInstr *ClonedMI = MF->CloneMachineInstr(MI);
+        CurrentBlock->push_back(ClonedMI);
       }
     }
 
-    // Insert appropriate branch after each body copy
+    // Insert appropriate branch for this iteration
     if (i < UnrollFactor - 1) {
-      // For all but the last iteration, insert inverted conditional branch to
-      // exit
+      // For all but the last iteration, insert inverted conditional branch
       SmallVector<MachineOperand, 4> InvertedCond(Cond);
       bool Inverted = TII->reverseBranchCondition(InvertedCond);
       assert(!Inverted && "Unable to invert branch condition for conditional branch");
       (void)Inverted; // Silence unused variable warning in release builds
 
-      // Insert branch: if inverted condition true, go to ExitBlock, else fall
-      // through
-      TII->insertBranch(*Header, ExitBlock, nullptr, InvertedCond,
-                        OrigBranch->getDebugLoc());
+      // Next block in unrolled sequence
+      MachineBasicBlock *NextBlock = (i == 0) ? NewBlocks[0] : NewBlocks[i];
+
+      // Check if the next block is the layout successor (fallthrough)
+      // If it is, we only need a conditional branch to exit
+      if (CurrentBlock->isLayoutSuccessor(NextBlock)) {
+        // Only insert conditional branch to exit, fall through to next block
+        TII->insertBranch(*CurrentBlock, ExitBlock, nullptr, InvertedCond,
+                          OrigBranch->getDebugLoc());
+      } else {
+        // Need both branches
+        TII->insertBranch(*CurrentBlock, ExitBlock, NextBlock, InvertedCond,
+                          OrigBranch->getDebugLoc());
+      }
     } else {
-      // For the last iteration, keep the original branch
-      TII->insertBranch(*Header, TBB, FBB, Cond, OrigBranch->getDebugLoc());
+      // For the last iteration, keep the original branch back to loop header
+      // The exit block is typically the fallthrough, so we might only need
+      // the conditional branch to Header
+      if (CurrentBlock->isLayoutSuccessor(ExitBlock)) {
+        // Only insert conditional branch to header, fall through to exit
+        TII->insertBranch(*CurrentBlock, Header, nullptr, Cond,
+                          OrigBranch->getDebugLoc());
+      } else {
+        // Need both branches
+        TII->insertBranch(*CurrentBlock, Header, ExitBlock, Cond,
+                          OrigBranch->getDebugLoc());
+      }
+    }
+  }
+
+  // Update the CFG - fix successor relationships
+  // First update Header's successors
+  if (UnrollFactor > 1 && !NewBlocks.empty()) {
+    // Header now branches to either first new block or exit
+    Header->removeSuccessor(Header); // Remove self-loop
+    if (!Header->isSuccessor(NewBlocks[0]))
+      Header->addSuccessor(NewBlocks[0]);
+    // ExitBlock successor should already be there
+  }
+
+  // Now add successors for the new blocks
+  for (unsigned i = 0; i < NewBlocks.size(); ++i) {
+    MachineBasicBlock *BB = NewBlocks[i];
+    // Each new block can exit
+    if (!BB->isSuccessor(ExitBlock))
+      BB->addSuccessor(ExitBlock);
+    // And can continue to next block or loop back
+    if (i < NewBlocks.size() - 1) {
+      if (!BB->isSuccessor(NewBlocks[i + 1]))
+        BB->addSuccessor(NewBlocks[i + 1]);
+    } else {
+      // Last block loops back to header
+      if (!BB->isSuccessor(Header))
+        BB->addSuccessor(Header);
     }
   }
 
   LLVM_DEBUG({
-    dbgs() << "  Duplicated loop by unroll factor " << UnrollFactor
+    dbgs() << "  Duplicated loop body with unroll factor " << UnrollFactor
            << "\n";
+    dbgs() << "  Created " << NewBlocks.size() << " new basic blocks\n";
     dbgs() << "  Exit block: BB#" << ExitBlock->getNumber() << "\n";
-    dbgs() << "  New instruction count: " << Header->size() << "\n";
-    dbgs() << "  Expected: "
-           << (InstsToClone.size() * UnrollFactor + UnrollFactor) << " (body * "
-           << UnrollFactor << " + " << UnrollFactor << " branches)\n";
   });
 }
 
