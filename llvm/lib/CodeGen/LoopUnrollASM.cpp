@@ -149,11 +149,16 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     if (!MI.isDebugInstr() && !MI.isPseudo()) {
       ++InstrCount;
 
-      // Check if this is a branch instruction
-      if (MI.isBranch() && !MI.isTerminator()) {
-        // Found a branch that's not a terminator - skip this loop
+      // Check if this is a branch or call instruction
+      // We want to exclude loops with any control flow changing instructions
+      // (branches, calls, returns) except for the terminator
+      if ((MI.isBranch() || MI.isCall() || MI.isReturn()) &&
+          !MI.isTerminator()) {
+        // Found a control flow instruction that's not a terminator - skip this
+        // loop
         hasInternalBranch = true;
-        LLVM_DEBUG(dbgs() << "  Loop has internal branch instruction, skipping\n");
+        LLVM_DEBUG(dbgs() << "  Loop has internal control flow instruction "
+                             "(branch/call/return), skipping\n");
         break;
       }
     }
@@ -176,7 +181,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 // -loop-unroll-asm-max-insts)
 // - Are single basic-block loops (Head == Latch)
 // - Have a conditional branch as the backedge
-// - Do not have any branch instructions within the loop body (excluding terminators)
+// - Loop body has no control flow instructions (branches/calls/returns)
 bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                                      MachineBasicBlock *Header,
                                      unsigned InstrCount) {
