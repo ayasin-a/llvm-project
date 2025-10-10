@@ -32,10 +32,9 @@ using namespace llvm;
 
 #define DEBUG_TYPE "loop-unroll-asm"
 
-STATISTIC(NumLoopsDetectedASM,
-          "Number of tight loops detected by LoopUnrollASM");
-STATISTIC(NumLoopsUnrolledASM,
-          "Number of tight loops unrolled by LoopUnrollASM");
+STATISTIC(NumLoopsDetected, "Number of tight loops detected by LoopUnrollASM");
+STATISTIC(NumLoopsUnrolled, "Number of tight loops unrolled by LoopUnrollASM");
+STATISTIC(NumLoopsFailedCondInversion, "Number of loops skipped due to branch inversion failure");
 
 static cl::opt<unsigned> LoopUnrollASMMaxInsts(
     "loop-unroll-asm-max-insts",
@@ -64,7 +63,8 @@ private:
   bool processLoop(MachineLoop *Loop, MachineFunction &MF);
   bool processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                         MachineBasicBlock *Header, unsigned InstrCount);
-  void duplicateLoopBody(MachineBasicBlock *Header, unsigned UnrollFactor);
+  void duplicateLoopBody(MachineBasicBlock *Header, unsigned UnrollFactor,
+                         const SmallVectorImpl<MachineOperand> &InvertedCond);
   unsigned countLoopInstructions(MachineLoop *Loop);
 };
 } // end anonymous namespace
@@ -150,7 +150,8 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 
 // processTightLoop() targets certain loops that meet these conditions:
 // - Are Inner-most loops
-// - Have less than N instructions (default 50, configurable via -loop-unroll-asm-max-insts)
+// - Have less than N instructions (default 46, configurable via
+// -loop-unroll-asm-max-insts)
 // - Are single basic-block loops (Head == Latch)
 // - Have a conditional branch as the backedge
 bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
@@ -197,15 +198,59 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
   LLVM_DEBUG(dbgs() << "  Inserted NOP at the beginning of the loop\n");
 #endif // if 0
 
-  ++NumLoopsDetectedASM;
+  ++NumLoopsDetected;
 
   const unsigned MachineWidth = 10;
-  unsigned bubbles = InstrCount % MachineWidth;
-  bubbles = bubbles ? MachineWidth - bubbles : 0;
-  if (bubbles > MachineWidth / 3) {
+  unsigned Bubbles = InstrCount % MachineWidth;
+  Bubbles = Bubbles ? MachineWidth - Bubbles : 0;
+  if (Bubbles > MachineWidth / 3) {
+    // First, we need to analyze the loop branch to see if we can invert it
+    const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
+
+    // Find the conditional branch that goes back to the header
+    MachineInstr *OrigBranch = nullptr;
+    for (auto I = Header->rbegin(); I != Header->rend(); ++I) {
+      if (I->isDebugInstr())
+        continue;
+      if (I->isConditionalBranch()) {
+        for (MachineOperand &MO : I->operands()) {
+          if (MO.isMBB() && MO.getMBB() == Header) {
+            OrigBranch = &*I;
+            break;
+          }
+        }
+        if (OrigBranch)
+          break;
+      }
+      if (!I->isTerminator())
+        break;
+    }
+
+    if (!OrigBranch) {
+      LLVM_DEBUG(dbgs() << "  Could not find conditional branch for unrolling\n");
+      return false;
+    }
+
+    // Analyze the original branch to extract condition
+    SmallVector<MachineOperand, 4> Cond;
+    MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
+
+    if (TII->analyzeBranch(*Header, TBB, FBB, Cond)) {
+      LLVM_DEBUG(dbgs() << "  Could not analyze branch for unrolling\n");
+      return false;
+    }
+
+    // Try to invert the condition
+    SmallVector<MachineOperand, 4> InvertedCond(Cond);
+    if (TII->reverseBranchCondition(InvertedCond)) {
+      LLVM_DEBUG(dbgs() << "  Unable to invert branch condition, skipping unrolling\n");
+      ++NumLoopsFailedCondInversion;
+      return false;
+    }
+
     // Duplicate the loop body with unroll factor of 2
-    duplicateLoopBody(Header, 2);
-    ++NumLoopsUnrolledASM;
+    duplicateLoopBody(Header, 2, InvertedCond);
+    ++NumLoopsUnrolled;
     return true;
   }
 
@@ -226,7 +271,8 @@ unsigned LoopUnrollASM::countLoopInstructions(MachineLoop *Loop) {
 }
 
 void LoopUnrollASM::duplicateLoopBody(MachineBasicBlock *Header,
-                                      unsigned UnrollFactor) {
+                                      unsigned UnrollFactor,
+                                      const SmallVectorImpl<MachineOperand> &InvertedCond) {
   assert (UnrollFactor > 1);
 
   MachineFunction *MF = Header->getParent();
@@ -324,11 +370,8 @@ void LoopUnrollASM::duplicateLoopBody(MachineBasicBlock *Header,
 
     // Insert appropriate branch for this iteration
     if (i < UnrollFactor - 1) {
-      // For all but the last iteration, insert inverted conditional branch
-      SmallVector<MachineOperand, 4> InvertedCond(Cond);
-      bool Inverted = TII->reverseBranchCondition(InvertedCond);
-      assert(!Inverted && "Unable to invert branch condition for conditional branch");
-      (void)Inverted; // Silence unused variable warning in release builds
+      // For all but the last iteration, use the inverted conditional branch
+      // that was already validated in processTightLoop
 
       // Next block in unrolled sequence
       MachineBasicBlock *NextBlock = (i == 0) ? NewBlocks[0] : NewBlocks[i];
