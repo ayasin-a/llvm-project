@@ -65,7 +65,6 @@ private:
                         MachineBasicBlock *Header, unsigned InstrCount);
   void duplicateLoopBody(MachineBasicBlock *Header, unsigned UnrollFactor,
                          const SmallVectorImpl<MachineOperand> &InvertedCond);
-  unsigned countLoopInstructions(MachineLoop *Loop);
 };
 } // end anonymous namespace
 
@@ -139,8 +138,31 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     return Changed;
   }
 
-  // Count instructions in the loop
-  unsigned InstrCount = countLoopInstructions(Loop);
+  // Count instructions in the loop and check for internal branches
+  // We want to skip loops that have branches within the loop body
+  // (excluding the terminator back-edge branch)
+  unsigned InstrCount = 0;
+  bool hasInternalBranch = false;
+
+  for (MachineInstr &MI : *Header) {
+    // Don't count debug instructions or pseudo instructions
+    if (!MI.isDebugInstr() && !MI.isPseudo()) {
+      ++InstrCount;
+
+      // Check if this is a branch instruction
+      if (MI.isBranch() && !MI.isTerminator()) {
+        // Found a branch that's not a terminator - skip this loop
+        hasInternalBranch = true;
+        LLVM_DEBUG(dbgs() << "  Loop has internal branch instruction, skipping\n");
+        break;
+      }
+    }
+  }
+
+  if (hasInternalBranch) {
+    return Changed;
+  }
+
   if (InstrCount >= LoopUnrollASMMaxInsts)
     return Changed;
 
@@ -154,6 +176,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 // -loop-unroll-asm-max-insts)
 // - Are single basic-block loops (Head == Latch)
 // - Have a conditional branch as the backedge
+// - Do not have any branch instructions within the loop body (excluding terminators)
 bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                                      MachineBasicBlock *Header,
                                      unsigned InstrCount) {
@@ -201,9 +224,12 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
   ++NumLoopsDetected;
 
   const unsigned MachineWidth = 10;
+  const unsigned LoopCycles =
+      (InstrCount + MachineWidth - 1) / MachineWidth; // round-up int divide
   unsigned Bubbles = InstrCount % MachineWidth;
   Bubbles = Bubbles ? MachineWidth - Bubbles : 0;
-  if (Bubbles > MachineWidth / 3) {
+  // Hanlde the case if the loop would possibly induce +20% Frontend Bound
+  if (Bubbles / float(MachineWidth * LoopCycles) > 0.2f) {
     // First, we need to analyze the loop branch to see if we can invert it
     const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
 
@@ -255,19 +281,6 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
   }
 
   return false;
-}
-
-unsigned LoopUnrollASM::countLoopInstructions(MachineLoop *Loop) {
-  unsigned Count = 0;
-  for (MachineBasicBlock *MBB : Loop->blocks()) {
-    for (MachineInstr &MI : *MBB) {
-      // Don't count debug instructions or pseudo instructions
-      if (!MI.isDebugInstr() && !MI.isPseudo()) {
-        ++Count;
-      }
-    }
-  }
-  return Count;
 }
 
 void LoopUnrollASM::duplicateLoopBody(MachineBasicBlock *Header,
