@@ -62,7 +62,7 @@ public:
 private:
   bool processLoop(MachineLoop *Loop, MachineFunction &MF);
   bool processTightLoop(MachineLoop *Loop, MachineFunction &MF,
-                        MachineBasicBlock *Header, unsigned LoopCount);
+                        MachineBasicBlock *Header, unsigned InstrCount);
   void duplicateLoopBody(MachineBasicBlock *Header, unsigned UnrollFactor,
                          const SmallVectorImpl<MachineOperand> &InvertedCond);
 };
@@ -138,13 +138,15 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     return Changed;
   }
 
-  // Get TargetInstrInfo for checking instruction properties
+#ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
+  // Get TargetInstrInfo for checking atomic operations
   const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
+#endif
 
   // Count instructions in the loop and check for internal branches
   // We want to skip loops that have branches within the loop body
   // (excluding the terminator back-edge branch)
-  unsigned LoopCount = 0;
+  unsigned InstrCount = 0;
   bool hasInternalBranch = false;
 #ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
   bool hasAtomicOps = false;
@@ -153,49 +155,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   for (MachineInstr &MI : *Header) {
     // Don't count debug instructions or pseudo instructions
     if (!MI.isDebugInstr() && !MI.isPseudo()) {
-      // Count the instruction (post-index inc/dec memory ops count as 2)
-      unsigned InstWeight = 1;
-
-      // Check if this is a post-index memory operation
-      // These instructions do both memory access and address update
-      if (MI.mayLoadOrStore()) {
-        // Check for post-index addressing mode indicators
-        // Look for instructions with "post" in the name or writeback operands
-        StringRef OpcodeName = TII->getName(MI.getOpcode());
-        if (OpcodeName.contains_insensitive("post") ||
-            OpcodeName.contains_insensitive("_POST") ||
-            // ARM specific post-index load/store instructions
-            OpcodeName.contains_insensitive("LDRWpost") ||
-            OpcodeName.contains_insensitive("LDRXpost") ||
-            OpcodeName.contains_insensitive("LDRSpost") ||
-            OpcodeName.contains_insensitive("LDRDpost") ||
-            OpcodeName.contains_insensitive("LDRQpost") ||
-            OpcodeName.contains_insensitive("LDRBpost") ||
-            OpcodeName.contains_insensitive("LDRHpost") ||
-            OpcodeName.contains_insensitive("STRWpost") ||
-            OpcodeName.contains_insensitive("STRXpost") ||
-            OpcodeName.contains_insensitive("STRSpost") ||
-            OpcodeName.contains_insensitive("STRDpost") ||
-            OpcodeName.contains_insensitive("STRQpost") ||
-            OpcodeName.contains_insensitive("STRBpost") ||
-            OpcodeName.contains_insensitive("STRHpost") ||
-            OpcodeName.contains_insensitive("STPWpost") ||
-            OpcodeName.contains_insensitive("STPXpost") ||
-            OpcodeName.contains_insensitive("STPSpost") ||
-            OpcodeName.contains_insensitive("STPDpost") ||
-            OpcodeName.contains_insensitive("STPQpost") ||
-            OpcodeName.contains_insensitive("LDPWpost") ||
-            OpcodeName.contains_insensitive("LDPXpost") ||
-            OpcodeName.contains_insensitive("LDPSpost") ||
-            OpcodeName.contains_insensitive("LDPDpost") ||
-            OpcodeName.contains_insensitive("LDPQpost")) {
-          InstWeight = 2; // Count post-index operations as 2 instructions
-          LLVM_DEBUG(dbgs() << "  Post-index memory operation counts as 2: "
-                            << OpcodeName << "\n");
-        }
-      }
-
-      LoopCount += InstWeight;
+      ++InstrCount;
 
       // Check if this is a branch or call instruction
       // We want to exclude loops with any control flow changing instructions
@@ -261,11 +221,11 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
 #endif
 
-  if (LoopCount >= LoopUnrollASMMaxInsts)
+  if (InstrCount >= LoopUnrollASMMaxInsts)
     return Changed;
 
   // Process the tight loop
-  return processTightLoop(Loop, MF, Header, LoopCount);
+  return processTightLoop(Loop, MF, Header, InstrCount);
 }
 
 // processTightLoop() targets certain loops that meet these conditions:
@@ -278,7 +238,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 // - Loop body has no atomic operations (ldxr/stxr, atomicrmw, etc.)
 bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                                      MachineBasicBlock *Header,
-                                     unsigned LoopCount) {
+                                     unsigned InstrCount) {
   // Get debug location information
   DebugLoc DL;
   for (MachineInstr &MI : *Header) {
@@ -300,7 +260,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
       }
       dbgs() << "\n";
     }
-    dbgs() << "  Loop count: " << LoopCount << "\n";
+    dbgs() << "  Instruction count: " << InstrCount << "\n";
     dbgs() << "  Loop header: BB#" << Header->getNumber() << "\n";
   });
 
