@@ -60,9 +60,18 @@ public:
   bool runOnMachineFunction(MachineFunction &MF) override;
 
 private:
+  // Static helper function to calculate bubbles
+  static unsigned calculateBubbles(unsigned LoopCount) {
+    const unsigned MachineWidth = 10;
+    unsigned Remainder = LoopCount % MachineWidth;
+    return Remainder ? MachineWidth - Remainder : 0;
+  }
+
   bool processLoop(MachineLoop *Loop, MachineFunction &MF);
   bool processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                         MachineBasicBlock *Header, unsigned LoopCount);
+  unsigned findBestUnrollCount(unsigned LoopCount, unsigned Bubbles,
+                               unsigned MachineWidth);
   void duplicateLoopBody(MachineBasicBlock *Header, unsigned UnrollFactor,
                          const SmallVectorImpl<MachineOperand> &InvertedCond);
 };
@@ -304,7 +313,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
       }
       dbgs() << "\n";
     }
-    dbgs() << "  Instruction count: " << LoopCount << "\n";
+    dbgs() << "  Loop count: " << LoopCount << "\n";
     dbgs() << "  Loop header: BB#" << Header->getNumber() << "\n";
   });
 
@@ -329,8 +338,8 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
   const unsigned MachineWidth = 10;
   const unsigned LoopCycles =
       (LoopCount + MachineWidth - 1) / MachineWidth; // round-up int divide
-  unsigned Bubbles = LoopCount % MachineWidth;
-  Bubbles = Bubbles ? MachineWidth - Bubbles : 0;
+
+  unsigned Bubbles = calculateBubbles(LoopCount);
   // Hanlde the case if the loop would possibly induce +20% Frontend Bound
   if (Bubbles / float(MachineWidth * LoopCycles) > 0.2f) {
     // First, we need to analyze the loop branch to see if we can invert it
@@ -377,13 +386,53 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
       return false;
     }
 
-    // Duplicate the loop body with unroll factor of 2
-    duplicateLoopBody(Header, 2, InvertedCond);
+    // Determine the best unroll factor based on minimizing bubbles
+    unsigned UnrollFactor =
+        findBestUnrollCount(LoopCount, Bubbles, MachineWidth);
+
+    // Duplicate the loop body with the calculated unroll factor
+    duplicateLoopBody(Header, UnrollFactor, InvertedCond);
     ++NumLoopsUnrolled;
     return true;
   }
 
   return false;
+}
+
+unsigned LoopUnrollASM::findBestUnrollCount(unsigned LoopCount,
+                                            unsigned Bubbles,
+                                            unsigned MachineWidth) {
+  unsigned BestUC = 2; // Start with the default unroll factor of 2
+  unsigned UC = 2;
+
+  while (true) {
+    // Calculate the new loop count after unrolling
+    unsigned NewLoopCount = LoopCount * UC;
+
+    // Stop if the new loop count exceeds 10 times the machine width
+    if (NewLoopCount > 10 * MachineWidth)
+      break;
+
+    // Calculate new bubbles for this unroll count
+    unsigned NewBubbles = calculateBubbles(NewLoopCount);
+    LLVM_DEBUG(dbgs() << "  findBestUnrollCount UC=" << UC
+                      << " NewBubbles=" << NewBubbles << " Bubbles=" << Bubbles
+                      << " LoopCount=" << LoopCount << "\n");
+
+    // Update best unroll count if we found fewer bubbles
+    if (NewBubbles < Bubbles) {
+      BestUC = UC;
+      Bubbles = NewBubbles; // Update Bubbles for comparison in next iteration
+    }
+
+    // Stop if we've eliminated all bubbles
+    if (NewBubbles == 0)
+      break;
+
+    ++UC;
+  }
+
+  return BestUC;
 }
 
 void LoopUnrollASM::duplicateLoopBody(MachineBasicBlock *Header,
