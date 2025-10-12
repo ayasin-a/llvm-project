@@ -13,8 +13,13 @@ define void @f(ptr %p, i32 %n, i32 %m) {
 ; CHECK-NEXT:    subs w1, w1, #1
 ; CHECK-NEXT:    strb wzr, [x0, w8, sxtw]
 ; CHECK-NEXT:    add w8, w8, #1
+; CHECK-NEXT:    b.eq .LBB0_3
+; CHECK-NEXT:  // %bb.2: //   in Loop: Header=BB0_1 Depth=1
+; CHECK-NEXT:    subs w1, w1, #1
+; CHECK-NEXT:    strb wzr, [x0, w8, sxtw]
+; CHECK-NEXT:    add w8, w8, #1
 ; CHECK-NEXT:    b.ne .LBB0_1
-; CHECK-NEXT:  // %bb.2: // %exit
+; CHECK-NEXT:  .LBB0_3: // %exit
 ; CHECK-NEXT:    ret
 entry:
   br label %loop
@@ -40,8 +45,13 @@ define void @f_without_freeze(ptr %p, i32 %n, i32 %m) {
 ; CHECK-NEXT:    subs w1, w1, #1
 ; CHECK-NEXT:    strb wzr, [x0, w8, sxtw]
 ; CHECK-NEXT:    add w8, w8, #1
+; CHECK-NEXT:    b.eq .LBB1_3
+; CHECK-NEXT:  // %bb.2: //   in Loop: Header=BB1_1 Depth=1
+; CHECK-NEXT:    subs w1, w1, #1
+; CHECK-NEXT:    strb wzr, [x0, w8, sxtw]
+; CHECK-NEXT:    add w8, w8, #1
 ; CHECK-NEXT:    b.ne .LBB1_1
-; CHECK-NEXT:  // %bb.2: // %exit
+; CHECK-NEXT:  .LBB1_3: // %exit
 ; CHECK-NEXT:    ret
 entry:
   br label %loop

@@ -15,6 +15,12 @@
 ; CHECK-NEXT: sub [[IVREG:x[0-9]+]],
 ; CHECK: [[IVREG]], #8
 ; CHECK-NEXT: cmp  [[IVREG]], #7
+; CHECK-NEXT: b.ls
+; CHECK: //   in Loop: Header=
+; CHECK: str x{{[0-9]+}}, [x{{[0-9]+}}], #8
+; CHECK-NEXT: sub [[IVREG2:x[0-9]+]],
+; CHECK: [[IVREG2]], #8
+; CHECK-NEXT: cmp  [[IVREG2]], #7
 ; CHECK-NEXT: b.hi
 define ptr @memset(ptr %dest, i32 %val, i64 %len) nounwind ssp noimplicitfloat {
 entry:

@@ -138,11 +138,19 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     return Changed;
   }
 
+#ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
+  // Get TargetInstrInfo for checking atomic operations
+  const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
+#endif
+
   // Count instructions in the loop and check for internal branches
   // We want to skip loops that have branches within the loop body
   // (excluding the terminator back-edge branch)
   unsigned InstrCount = 0;
   bool hasInternalBranch = false;
+#ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
+  bool hasAtomicOps = false;
+#endif
 
   for (MachineInstr &MI : *Header) {
     // Don't count debug instructions or pseudo instructions
@@ -161,12 +169,57 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
                              "(branch/call/return), skipping\n");
         break;
       }
+
+#ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
+      // Check for atomic operations
+      // We want to avoid unrolling loops with atomic operations,
+      // especially exclusive load/store operations (ldxr/stxr on ARM)
+      if (MI.hasOrderedMemoryRef() || MI.mayLoadOrStore()) {
+        // Check if this is an atomic operation by looking at the opcode name
+        // or memory operand flags
+        StringRef OpcodeName = TII->getName(MI.getOpcode());
+        // Check for exclusive operations (ARM specific)
+        if (OpcodeName.contains_insensitive("ldxr") ||
+            OpcodeName.contains_insensitive("stxr") ||
+            OpcodeName.contains_insensitive("ldaxr") ||
+            OpcodeName.contains_insensitive("stlxr") ||
+            OpcodeName.contains_insensitive("cas") ||
+            OpcodeName.contains_insensitive("swp") ||
+            OpcodeName.contains_insensitive("ldadd") ||
+            OpcodeName.contains_insensitive("ldclr") ||
+            OpcodeName.contains_insensitive("ldeor") ||
+            OpcodeName.contains_insensitive("ldset")) {
+          hasAtomicOps = true;
+          LLVM_DEBUG(dbgs() << "  Loop contains atomic/exclusive operations, "
+                               "skipping unrolling\n");
+          break;
+        }
+
+        // Also check memory operands for atomic flags
+        for (MachineMemOperand *MMO : MI.memoperands()) {
+          if (MMO->isAtomic()) {
+            hasAtomicOps = true;
+            LLVM_DEBUG(dbgs() << "  Loop contains atomic memory operations, "
+                                 "skipping unrolling\n");
+            break;
+          }
+        }
+        if (hasAtomicOps)
+          break;
+      }
+#endif // LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
     }
   }
 
+#ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
+  if (hasInternalBranch || hasAtomicOps) {
+    return Changed;
+  }
+#else
   if (hasInternalBranch) {
     return Changed;
   }
+#endif
 
   if (InstrCount >= LoopUnrollASMMaxInsts)
     return Changed;
@@ -182,6 +235,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 // - Are single basic-block loops (Head == Latch)
 // - Have a conditional branch as the backedge
 // - Loop body has no control flow instructions (branches/calls/returns)
+// - Loop body has no atomic operations (ldxr/stxr, atomicrmw, etc.)
 bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                                      MachineBasicBlock *Header,
                                      unsigned InstrCount) {
