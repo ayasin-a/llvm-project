@@ -1222,8 +1222,9 @@ void TargetPassConfig::addMachinePasses() {
   if (getOptLevel() != CodeGenOptLevel::None)
     addBlockPlacement();
 
-  // Loop unrolling at assembly level.
-  addPass(&LoopUnrollASMID);
+  // Loop unrolling at assembly level (only at -O3).
+  if (getOptLevel() == CodeGenOptLevel::Aggressive)
+    addPass(&LoopUnrollASMID);
 
   // Insert before XRay Instrumentation.
   addPass(&FEntryInserterID);

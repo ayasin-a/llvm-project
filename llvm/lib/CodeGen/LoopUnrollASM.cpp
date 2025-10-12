@@ -364,6 +364,13 @@ void LoopUnrollASM::duplicateLoopBody(MachineBasicBlock *Header,
   for (unsigned i = 1; i < UnrollFactor; ++i) {
     MachineBasicBlock *NewBB = MF->CreateMachineBasicBlock();
     MF->insert(++MachineFunction::iterator(PrevBlock), NewBB);
+
+    // Copy live-in registers from the original header block
+    // These registers are needed by the cloned instructions
+    for (const auto &LI : Header->liveins()) {
+      NewBB->addLiveIn(LI.PhysReg);
+    }
+
     NewBlocks.push_back(NewBB);
     PrevBlock = NewBB;
   }
