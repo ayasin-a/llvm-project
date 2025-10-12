@@ -83,8 +83,12 @@ define i8 @loopcmp(ptr nocapture noundef readonly %x, i8 noundef %y) {
 ; CHECK-O3-NEXT:    // =>This Inner Loop Header: Depth=1
 ; CHECK-O3-NEXT:    ldrb w8, [x0], #1
 ; CHECK-O3-NEXT:    cmp w8, w9
+; CHECK-O3-NEXT:    b.hs .LBB1_3
+; CHECK-O3-NEXT:  // %bb.2: //   in Loop: Header=BB1_1 Depth=1
+; CHECK-O3-NEXT:    ldrb w8, [x0], #1
+; CHECK-O3-NEXT:    cmp w8, w9
 ; CHECK-O3-NEXT:    b.lo .LBB1_1
-; CHECK-O3-NEXT:  // %bb.2: // %while.end
+; CHECK-O3-NEXT:  .LBB1_3: // %while.end
 ; CHECK-O3-NEXT:    mov w0, w8
 ; CHECK-O3-NEXT:    ret
 entry:

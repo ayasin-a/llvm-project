@@ -455,17 +455,23 @@ e2:
 }
 
 define void @test_successor_with_loop_phi(ptr %A, ptr %B) {
-; CHECK-SD-LABEL: test_successor_with_loop_phi:
-; CHECK-SD:       ; %bb.0: ; %entry
-; CHECK-SD-NEXT:  LBB7_1: ; %loop
-; CHECK-SD-NEXT:    ; =>This Inner Loop Header: Depth=1
-; CHECK-SD-NEXT:    ldr w8, [x0]
-; CHECK-SD-NEXT:    str wzr, [x0]
-; CHECK-SD-NEXT:    mov x0, x1
-; CHECK-SD-NEXT:    tst w8, #0xfffffffb
-; CHECK-SD-NEXT:    b.eq LBB7_1
-; CHECK-SD-NEXT:  ; %bb.2: ; %exit
-; CHECK-SD-NEXT:    ret
+; CHECK-LABEL: test_successor_with_loop_phi:
+; CHECK:       ; %bb.0: ; %entry
+; CHECK-NEXT:  LBB7_1: ; %loop
+; CHECK-NEXT:    ; =>This Inner Loop Header: Depth=1
+; CHECK-NEXT:    ldr w8, [x0]
+; CHECK-NEXT:    str wzr, [x0]
+; CHECK-NEXT:    mov x0, x1
+; CHECK-NEXT:    tst w8, #0xfffffffb
+; CHECK-NEXT:    b.ne LBB7_3
+; CHECK-NEXT:  ; %bb.2: ;   in Loop: Header=BB7_1 Depth=1
+; CHECK-NEXT:    ldr w8, [x0]
+; CHECK-NEXT:    str wzr, [x0]
+; CHECK-NEXT:    mov x0, x1
+; CHECK-NEXT:    tst w8, #0xfffffffb
+; CHECK-NEXT:    b.eq LBB7_1
+; CHECK-NEXT:  LBB7_3: ; %exit
+; CHECK-NEXT:    ret
 ;
 ; CHECK-GI-LABEL: test_successor_with_loop_phi:
 ; CHECK-GI:       ; %bb.0: ; %entry

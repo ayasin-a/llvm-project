@@ -5,7 +5,7 @@ define void @fma_dup_f16(ptr noalias nocapture noundef readonly %A, half noundef
 ; CHECK-LABEL: fma_dup_f16:
 ; CHECK:       // %bb.0: // %entry
 ; CHECK-NEXT:    // kill: def $h0 killed $h0 def $q0
-; CHECK-NEXT:    cbz w2, .LBB0_8
+; CHECK-NEXT:    cbz w2, .LBB0_9
 ; CHECK-NEXT:  // %bb.1: // %for.body.preheader
 ; CHECK-NEXT:    cmp w2, #15
 ; CHECK-NEXT:    mov w8, w2
@@ -31,7 +31,7 @@ define void @fma_dup_f16(ptr noalias nocapture noundef readonly %A, half noundef
 ; CHECK-NEXT:    b.ne .LBB0_4
 ; CHECK-NEXT:  // %bb.5: // %middle.block
 ; CHECK-NEXT:    cmp x9, x8
-; CHECK-NEXT:    b.eq .LBB0_8
+; CHECK-NEXT:    b.eq .LBB0_9
 ; CHECK-NEXT:  .LBB0_6: // %for.body.preheader1
 ; CHECK-NEXT:    lsl x10, x9, #1
 ; CHECK-NEXT:    sub x8, x8, x9
@@ -44,8 +44,15 @@ define void @fma_dup_f16(ptr noalias nocapture noundef readonly %A, half noundef
 ; CHECK-NEXT:    subs x8, x8, #1
 ; CHECK-NEXT:    fmadd h1, h1, h0, h2
 ; CHECK-NEXT:    str h1, [x9], #2
+; CHECK-NEXT:    b.eq .LBB0_9
+; CHECK-NEXT:  // %bb.8: //   in Loop: Header=BB0_7 Depth=1
+; CHECK-NEXT:    ldr h1, [x10], #2
+; CHECK-NEXT:    ldr h2, [x9]
+; CHECK-NEXT:    subs x8, x8, #1
+; CHECK-NEXT:    fmadd h1, h1, h0, h2
+; CHECK-NEXT:    str h1, [x9], #2
 ; CHECK-NEXT:    b.ne .LBB0_7
-; CHECK-NEXT:  .LBB0_8: // %for.cond.cleanup
+; CHECK-NEXT:  .LBB0_9: // %for.cond.cleanup
 ; CHECK-NEXT:    ret
 entry:
   %cmp6.not = icmp eq i32 %n, 0
