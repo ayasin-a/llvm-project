@@ -35,20 +35,21 @@ using namespace llvm;
 STATISTIC(NumLoopsDetected, "Number of tight loops detected by LoopUnrollASM");
 STATISTIC(NumLoopsUnrolled, "Number of tight loops unrolled by LoopUnrollASM");
 STATISTIC(NumLoopsFailedCondInversion, "Number of loops skipped due to branch inversion failure");
+STATISTIC(NumLoopsNotEnoughBubbles, "Number of tight loops skipped (not enough bubbles)");
 STATISTIC(NumInnerLoopsNotSingleLatch, "Number of inner loops skipped (not single latch)");
 STATISTIC(NumInnerLoopsMultipleTerminators, "Number of inner loops skipped (multiple terminators)");
 STATISTIC(NumInnermostLoops, "Number of inner loops skipped (not innermost)");
 STATISTIC(NumInnerLoopsNoNonDebugInsts, "Number of inner loops skipped (no non-debug instructions)");
-STATISTIC(NumInnerLoopsNoBranch, "Number of inner loops skipped (no branch at end)");
-STATISTIC(NumInnerLoopsUnconditionalBranch, "Number of inner loops skipped (unconditional branch)");
-STATISTIC(NumInnerLoopsNoConditionalBranch, "Number of inner loops skipped (no conditional branch)");
+STATISTIC(NumInnerLoopsBranchUnconditional, "Number of inner loops skipped (unconditional branch)");
+STATISTIC(NumInnerLoopsBranchUnconditionalWithSingleCondInternal, "Number of inner loops skipped (unconditional branch with single conditional internal)");
+STATISTIC(NumInnerLoopsBranchIndirect, "Number of inner loops skipped (indirect branch)");
+STATISTIC(NumInnerLoopsBranchConditionalNoBackedge, "Number of inner loops skipped (conditional branch without backedge)");
 STATISTIC(NumInnerLoopsNotSingleBB, "Number of inner loops skipped (Header != Latch)");
 STATISTIC(NumInnerLoopsHasAtomicOps, "Number of inner loops skipped (has atomic ops)");
 STATISTIC(NumInnerLoopsHasInternalBranch, "Number of inner loops skipped (has internal branch)");
 STATISTIC(NumInnerLoopsTooManyInsts, "Number of inner loops skipped (too many instructions)");
 STATISTIC(NumInnerLoopsCannotAnalyzeBranch, "Number of tight loops skipped (cannot analyze branch)");
 STATISTIC(NumInnerLoopsCannotInvertCond, "Number of tight loops skipped (cannot invert condition)");
-STATISTIC(NumInnerLoopsNotEnoughBubbles, "Number of tight loops skipped (not enough bubbles)");
 
 static cl::opt<unsigned> LoopUnrollASMMaxInsts(
     "loop-unroll-asm-max-insts",
@@ -161,7 +162,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   // We want to skip loops that have branches within the loop body
   // (excluding the terminator back-edge branch)
   unsigned LoopCount = 0;
-  bool hasInternalBranch = false;
+  SmallVector<MachineInstr *, 4> InternalBranches;
 #ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
   bool hasAtomicOps = false;
 #endif
@@ -222,7 +223,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
           !MI.isTerminator()) {
         // Found a control flow instruction that's not a terminator - skip this
         // loop
-        hasInternalBranch = true;
+        InternalBranches.push_back(&MI);
         LLVM_DEBUG(dbgs() << "  Loop has internal control flow instruction "
                              "(branch/call/return), skipping\n");
         break;
@@ -290,17 +291,22 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     return Changed; // multiple terminators
   }
 
-  if (!Last->isBranch()) {
-    ++NumInnerLoopsNoBranch;
+  assert(Last->isBranch() && "Last instruction must be a branch");
+
+  // Classify the branch type and skip if not suitable for unrolling
+  if (Last->isUnconditionalBranch()) {
+    ++NumInnerLoopsBranchUnconditional;
+    // Sub-case: check if there's a single internal conditional branch
+    if (InternalBranches.size() == 1 && InternalBranches[0]->isConditionalBranch())
+      ++NumInnerLoopsBranchUnconditionalWithSingleCondInternal;
     return Changed;
   }
-
-  if (Last->isUnconditionalBranch()) {
-    ++NumInnerLoopsUnconditionalBranch;
+  if (Last->isIndirectBranch()) {
+    ++NumInnerLoopsBranchIndirect;
     return Changed;
   }
   if (!hasConditionalBranch) {
-    ++NumInnerLoopsNoConditionalBranch;
+    ++NumInnerLoopsBranchConditionalNoBackedge;
     return Changed;
   }
 
@@ -317,7 +323,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
 #endif
 
-  if (hasInternalBranch) {
+  if (!InternalBranches.empty()) {
     ++NumInnerLoopsHasInternalBranch;
     return Changed;
   }
@@ -448,7 +454,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     return true;
   }
 
-  ++NumInnerLoopsNotEnoughBubbles;
+  ++NumLoopsNotEnoughBubbles;
   return false;
 }
 
