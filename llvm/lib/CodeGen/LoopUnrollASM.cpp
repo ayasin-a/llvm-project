@@ -35,6 +35,20 @@ using namespace llvm;
 STATISTIC(NumLoopsDetected, "Number of tight loops detected by LoopUnrollASM");
 STATISTIC(NumLoopsUnrolled, "Number of tight loops unrolled by LoopUnrollASM");
 STATISTIC(NumLoopsFailedCondInversion, "Number of loops skipped due to branch inversion failure");
+STATISTIC(NumInnerLoopsNotSingleLatch, "Number of inner loops skipped (not single latch)");
+STATISTIC(NumInnerLoopsMultipleTerminators, "Number of inner loops skipped (multiple terminators)");
+STATISTIC(NumInnermostLoops, "Number of inner loops skipped (not innermost)");
+STATISTIC(NumInnerLoopsNoNonDebugInsts, "Number of inner loops skipped (no non-debug instructions)");
+STATISTIC(NumInnerLoopsNoBranch, "Number of inner loops skipped (no branch at end)");
+STATISTIC(NumInnerLoopsUnconditionalBranch, "Number of inner loops skipped (unconditional branch)");
+STATISTIC(NumInnerLoopsNoConditionalBranch, "Number of inner loops skipped (no conditional branch)");
+STATISTIC(NumInnerLoopsNotSingleBB, "Number of inner loops skipped (Header != Latch)");
+STATISTIC(NumInnerLoopsHasAtomicOps, "Number of inner loops skipped (has atomic ops)");
+STATISTIC(NumInnerLoopsHasInternalBranch, "Number of inner loops skipped (has internal branch)");
+STATISTIC(NumInnerLoopsTooManyInsts, "Number of inner loops skipped (too many instructions)");
+STATISTIC(NumInnerLoopsCannotAnalyzeBranch, "Number of tight loops skipped (cannot analyze branch)");
+STATISTIC(NumInnerLoopsCannotInvertCond, "Number of tight loops skipped (cannot invert condition)");
+STATISTIC(NumInnerLoopsNotEnoughBubbles, "Number of tight loops skipped (not enough bubbles)");
 
 static cl::opt<unsigned> LoopUnrollASMMaxInsts(
     "loop-unroll-asm-max-insts",
@@ -111,13 +125,10 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   if (!Loop->getSubLoops().empty()) {
     return Changed;
   }
+  ++NumInnermostLoops;
 
-  // Check if this is a single basic block loop (Head == Latch)
   MachineBasicBlock *Header = Loop->getHeader();
   MachineBasicBlock *Latch = Loop->getLoopLatch();
-  if (!Header || !Latch || Header != Latch)
-    return Changed;
-
   // Check if the loop has a conditional branch back edge
   // Note: The conditional branch might not be the last instruction if there's
   // also an unconditional branch to the exit block
@@ -139,12 +150,6 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     // Stop looking after we've seen all terminators
     if (!I->isTerminator())
       break;
-  }
-
-  if (!hasConditionalBranch) {
-    LLVM_DEBUG(
-        dbgs() << "  Loop does not have a conditional branch back to header\n");
-    return Changed;
   }
 
 #ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
@@ -264,18 +269,63 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     }
   }
 
-#ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
-  if (hasInternalBranch || hasAtomicOps) {
+  SmallVector<MachineBasicBlock *, 4> Latches;
+  Loop->getLoopLatches(Latches);
+  if (Latches.size() != 1) {
+    ++NumInnerLoopsNotSingleLatch;
     return Changed;
   }
-#else
-  if (hasInternalBranch) {
+
+  assert(Latch == Latches[0]);
+  MachineBasicBlock::iterator LastIter = Latch->getLastNonDebugInstr();
+  if (LastIter == Latch->end()) {
+    ++NumInnerLoopsNoNonDebugInsts;
+    return Changed; // No non-debug instructions
+  }
+  MachineInstr *Last = &*LastIter;
+
+  // Check if there is exactly one terminator and it's unconditional
+  if (Latch->getFirstTerminator() != LastIter) {
+    ++NumInnerLoopsMultipleTerminators;
+    return Changed; // multiple terminators
+  }
+
+  if (!Last->isBranch()) {
+    ++NumInnerLoopsNoBranch;
+    return Changed;
+  }
+
+  if (Last->isUnconditionalBranch()) {
+    ++NumInnerLoopsUnconditionalBranch;
+    return Changed;
+  }
+  if (!hasConditionalBranch) {
+    ++NumInnerLoopsNoConditionalBranch;
+    return Changed;
+  }
+
+  // Check if this is a single basic block loop (Head == Latch)
+  if (!Header || !Latch || Header != Latch) {
+    ++NumInnerLoopsNotSingleBB;
+    return Changed;
+  }
+
+#ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
+  if (hasAtomicOps) {
+    ++NumInnerLoopsHasAtomicOps;
     return Changed;
   }
 #endif
 
-  if (LoopCount >= LoopUnrollASMMaxInsts)
+  if (hasInternalBranch) {
+    ++NumInnerLoopsHasInternalBranch;
     return Changed;
+  }
+
+  if (LoopCount >= LoopUnrollASMMaxInsts) {
+    ++NumInnerLoopsTooManyInsts;
+    return Changed;
+  }
 
   // Process the tight loop
   return processTightLoop(Loop, MF, Header, LoopCount);
@@ -375,6 +425,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
 
     if (TII->analyzeBranch(*Header, TBB, FBB, Cond)) {
       LLVM_DEBUG(dbgs() << "  Could not analyze branch for unrolling\n");
+      ++NumInnerLoopsCannotAnalyzeBranch;
       return false;
     }
 
@@ -382,6 +433,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     SmallVector<MachineOperand, 4> InvertedCond(Cond);
     if (TII->reverseBranchCondition(InvertedCond)) {
       LLVM_DEBUG(dbgs() << "  Unable to invert branch condition, skipping unrolling\n");
+      ++NumInnerLoopsCannotInvertCond;
       ++NumLoopsFailedCondInversion;
       return false;
     }
@@ -396,6 +448,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     return true;
   }
 
+  ++NumInnerLoopsNotEnoughBubbles;
   return false;
 }
 
