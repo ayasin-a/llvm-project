@@ -49,7 +49,6 @@ STATISTIC(NumInnerLoopsHasAtomicOps, "Number of inner loops skipped (has atomic 
 STATISTIC(NumInnerLoopsHasInternalBranch, "Number of inner loops skipped (has internal branch)");
 STATISTIC(NumInnerLoopsTooManyInsts, "Number of inner loops skipped (too many instructions)");
 STATISTIC(NumInnerLoopsCannotAnalyzeBranch, "Number of tight loops skipped (cannot analyze branch)");
-STATISTIC(NumInnerLoopsCannotInvertCond, "Number of tight loops skipped (cannot invert condition)");
 
 static cl::opt<unsigned> LoopUnrollASMMaxInsts(
     "loop-unroll-asm-max-insts",
@@ -439,7 +438,6 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     SmallVector<MachineOperand, 4> InvertedCond(Cond);
     if (TII->reverseBranchCondition(InvertedCond)) {
       LLVM_DEBUG(dbgs() << "  Unable to invert branch condition, skipping unrolling\n");
-      ++NumInnerLoopsCannotInvertCond;
       ++NumLoopsFailedCondInversion;
       return false;
     }
@@ -468,8 +466,8 @@ unsigned LoopUnrollASM::findBestUnrollCount(unsigned LoopCount,
     // Calculate the new loop count after unrolling
     unsigned NewLoopCount = LoopCount * UC;
 
-    // Stop if the new loop count exceeds 10 times the machine width
-    if (NewLoopCount > 10 * MachineWidth)
+    // Stop if the new loop count is too large
+    if (NewLoopCount > 12 * MachineWidth)
       break;
 
     // Calculate new bubbles for this unroll count
