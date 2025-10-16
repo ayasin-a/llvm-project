@@ -34,6 +34,7 @@ using namespace llvm;
 
 STATISTIC(NumLoopsDetected, "Number of tight loops detected by LoopUnrollASM");
 STATISTIC(NumLoopsUnrolled, "Number of tight loops unrolled by LoopUnrollASM");
+STATISTIC(NumLoopsUnrolledTwoTerminators, "Number of tight loops unrolled with two terminators");
 STATISTIC(NumLoopsFailedCondInversion, "Number of loops skipped due to branch inversion failure");
 STATISTIC(NumLoopsNotEnoughBubbles, "Number of tight loops skipped (not enough bubbles)");
 STATISTIC(NumInnerLoopsNotSingleLatch, "Number of inner loops skipped (not single latch)");
@@ -85,7 +86,8 @@ private:
                           StringRef Prefix);
   bool processLoop(MachineLoop *Loop, MachineFunction &MF);
   bool processTightLoop(MachineLoop *Loop, MachineFunction &MF,
-                        MachineBasicBlock *Header, unsigned LoopCount);
+                        MachineBasicBlock *Header, unsigned LoopCount,
+                        bool hasTwoTerminators);
   unsigned findBestUnrollCount(unsigned LoopCount, unsigned Bubbles,
                                unsigned MachineWidth);
   void duplicateLoopBody(MachineBasicBlock *Header, unsigned UnrollFactor,
@@ -283,17 +285,31 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
   MachineInstr *Last = &*LastIter;
 
-  // Check if there is exactly one terminator and it's unconditional
-  if (Latch->getFirstTerminator() != LastIter) {
-    ++NumInnerLoopsMultipleTerminators;
-    LLVM_DEBUG(dbgs() << "  skipping: Multiple terminators\n");
-    return Changed; // multiple terminators
+  // Check if there is exactly one terminator, or two terminators where
+  // the first is conditional and the second is unconditional
+  bool hasTwoTerminators = false;
+  MachineBasicBlock::iterator FirstTermIter = Latch->getFirstTerminator();
+  if (FirstTermIter != LastIter) {
+    // Multiple terminators - check if it's the acceptable pattern
+    // (conditional followed by unconditional)
+    auto SecondTermIter = std::next(FirstTermIter);
+    if (SecondTermIter == LastIter &&
+        FirstTermIter->isConditionalBranch() &&
+        Last->isUnconditionalBranch()) {
+      // This is acceptable: conditional branch followed by unconditional branch
+      hasTwoTerminators = true;
+      LLVM_DEBUG(dbgs() << "  Detected two-terminator pattern (cond + uncond)\n");
+    } else {
+      ++NumInnerLoopsMultipleTerminators;
+      LLVM_DEBUG(dbgs() << "  skipping: Multiple terminators (not cond+uncond pattern)\n");
+      return Changed;
+    }
   }
 
   assert(Last->isBranch() && "Last instruction must be a branch");
 
   // Classify the branch type and skip if not suitable for unrolling
-  if (Last->isUnconditionalBranch()) {
+  if (!hasTwoTerminators && Last->isUnconditionalBranch()) {
     ++NumInnerLoopsBranchUnconditional;
     // Sub-case: check if there's a single internal conditional branch
     if (InternalBranches.size() == 1 && InternalBranches[0]->isConditionalBranch())
@@ -306,7 +322,10 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     LLVM_DEBUG(dbgs() << "  skipping: Indirect branch\n");
     return Changed;
   }
-  if (!hasConditionalBranch) {
+
+  // For two-terminator pattern, we already know we have a conditional branch
+  // For single-terminator, we need to verify it's conditional with backedge
+  if (!hasTwoTerminators && !hasConditionalBranch) {
     ++NumInnerLoopsBranchConditionalNoBackedge;
     LLVM_DEBUG(dbgs() << "  skipping: Conditional branch without backedge\n");
     return Changed;
@@ -339,8 +358,12 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     return Changed;
   }
 
+  // For two-terminator pattern, decrement LoopCount by 1 since the unconditional
+  // branch is not part of the actual loop body
+  unsigned AdjustedLoopCount = hasTwoTerminators ? LoopCount - 1 : LoopCount;
+
   // Process the tight loop
-  return processTightLoop(Loop, MF, Header, LoopCount);
+  return processTightLoop(Loop, MF, Header, AdjustedLoopCount, hasTwoTerminators);
 }
 
 void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
@@ -380,10 +403,13 @@ void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
 // - Loop body has no atomic operations (ldxr/stxr, atomicrmw, etc.)
 bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                                      MachineBasicBlock *Header,
-                                     unsigned LoopCount) {
+                                     unsigned LoopCount, bool hasTwoTerminators) {
   debugPrintLoopInfo(MF, Header, "Found qualifying");
 
   LLVM_DEBUG(dbgs() << "  Loop count: " << LoopCount << "\n");
+  if (hasTwoTerminators) {
+    LLVM_DEBUG(dbgs() << "  Two-terminator pattern detected\n");
+  }
 
 #if 0
   // Insert NOP at the beginning of the loop
@@ -462,6 +488,9 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     // Duplicate the loop body with the calculated unroll factor
     duplicateLoopBody(Header, UnrollFactor, InvertedCond);
     ++NumLoopsUnrolled;
+    if (hasTwoTerminators) {
+      ++NumLoopsUnrolledTwoTerminators;
+    }
     return true;
   }
 
