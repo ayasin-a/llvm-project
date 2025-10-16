@@ -293,7 +293,9 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     // Multiple terminators - check if it's the acceptable pattern
     // (conditional followed by unconditional)
     auto SecondTermIter = std::next(FirstTermIter);
+    // Make sure we have exactly two terminators in sequence and they match the pattern
     if (SecondTermIter == LastIter &&
+        FirstTermIter != Latch->end() &&
         FirstTermIter->isConditionalBranch() &&
         Last->isUnconditionalBranch()) {
       // This is acceptable: conditional branch followed by unconditional branch
