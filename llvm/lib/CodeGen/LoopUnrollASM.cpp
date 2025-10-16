@@ -39,6 +39,9 @@ STATISTIC(NumLoopsFailedCondInversion, "Number of loops skipped due to branch in
 STATISTIC(NumLoopsNotEnoughBubbles, "Number of tight loops skipped (not enough bubbles)");
 STATISTIC(NumInnerLoopsNotSingleLatch, "Number of inner loops skipped (not single latch)");
 STATISTIC(NumInnerLoopsMultipleTerminators, "Number of inner loops skipped (multiple terminators)");
+STATISTIC(NumInnerLoopsMultipleTerminators2, "Number of inner loops skipped (2 terminators, non-standard)");
+STATISTIC(NumInnerLoopsMultipleTerminators3, "Number of inner loops skipped (3 terminators)");
+STATISTIC(NumInnerLoopsMultipleTerminators4Plus, "Number of inner loops skipped (4+ terminators)");
 STATISTIC(NumInnermostLoops, "Number of inner loops skipped (not innermost)");
 STATISTIC(NumInnerLoopsNoNonDebugInsts, "Number of inner loops skipped (no non-debug instructions)");
 STATISTIC(NumInnerLoopsBranchUnconditional, "Number of inner loops skipped (unconditional branch)");
@@ -125,16 +128,16 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     Changed |= processLoop(SubLoop, MF);
   }
 
+  MachineBasicBlock *Header = Loop->getHeader();
+  debugPrintLoopInfo(MF, Header, "Examining");
+
   // Only process innermost loops
   if (!Loop->getSubLoops().empty()) {
     LLVM_DEBUG(dbgs() << "  skipping: Not innermost\n");
     return Changed;
   }
   ++NumInnermostLoops;
-
-  MachineBasicBlock *Header = Loop->getHeader();
   MachineBasicBlock *Latch = Loop->getLoopLatch();
-  debugPrintLoopInfo(MF, Header, "Examining");
 
   // Check if the loop has a conditional branch back edge
   // Note: The conditional branch might not be the last instruction if there's
@@ -173,9 +176,13 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   bool hasAtomicOps = false;
 #endif
 
-  for (MachineInstr &MI : *Header) {
-    // Don't count debug instructions or pseudo instructions
-    if (!MI.isDebugInstr() && !MI.isPseudo()) {
+  // Iterate over all blocks in the loop
+  for (MachineBasicBlock *MBB : Loop->blocks()) {
+    for (MachineInstr &MI : *MBB) {
+      // Skip debug instructions and pseudo instructions
+      if (MI.isDebugInstr() || MI.isPseudo())
+        continue;
+
       ++LoopCount;
 
       // Check if this is a post-index memory operation
@@ -225,10 +232,8 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       // (branches, calls, returns) except for the terminator
       if ((MI.isBranch() || MI.isCall() || MI.isReturn()) &&
           !MI.isTerminator()) {
-        // Found a control flow instruction that's not a terminator - skip this
-        // loop
+        // Found a control flow instruction that's not a terminator
         InternalBranches.push_back(&MI);
-        break;
       }
 
 #ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
@@ -290,8 +295,14 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   bool hasTwoTerminators = false;
   MachineBasicBlock::iterator FirstTermIter = Latch->getFirstTerminator();
   if (FirstTermIter != LastIter) {
-    // Multiple terminators - check if it's the acceptable pattern
-    // (conditional followed by unconditional)
+    // Multiple terminators - count them
+    unsigned NumTerminators = 0;
+    for (auto It = FirstTermIter; It != Latch->end(); ++It) {
+      if (It->isTerminator())
+        ++NumTerminators;
+    }
+
+    // Check if it's the acceptable two-terminator pattern
     auto SecondTermIter = std::next(FirstTermIter);
     // Make sure we have exactly two terminators in sequence and they match the pattern
     if (SecondTermIter == LastIter &&
@@ -303,7 +314,14 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       LLVM_DEBUG(dbgs() << "  Detected two-terminator pattern (cond + uncond)\n");
     } else {
       ++NumInnerLoopsMultipleTerminators;
-      LLVM_DEBUG(dbgs() << "  skipping: Multiple terminators (not cond+uncond pattern)\n");
+      // Increment the specific counter based on number of terminators
+      if (NumTerminators == 2)
+        ++NumInnerLoopsMultipleTerminators2;
+      else if (NumTerminators == 3)
+        ++NumInnerLoopsMultipleTerminators3;
+      else if (NumTerminators >= 4)
+        ++NumInnerLoopsMultipleTerminators4Plus;
+      LLVM_DEBUG(dbgs() << "  skipping: Multiple terminators (" << NumTerminators << ", not cond+uncond pattern)\n");
       return Changed;
     }
   }
