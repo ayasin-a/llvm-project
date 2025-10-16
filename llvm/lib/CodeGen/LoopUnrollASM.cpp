@@ -81,6 +81,8 @@ private:
     return Remainder ? MachineWidth - Remainder : 0;
   }
 
+  void debugPrintLoopInfo(MachineFunction &MF, MachineBasicBlock *Header,
+                          StringRef Prefix);
   bool processLoop(MachineLoop *Loop, MachineFunction &MF);
   bool processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                         MachineBasicBlock *Header, unsigned LoopCount);
@@ -123,12 +125,15 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 
   // Only process innermost loops
   if (!Loop->getSubLoops().empty()) {
+    LLVM_DEBUG(dbgs() << "  skipping: Not innermost\n");
     return Changed;
   }
   ++NumInnermostLoops;
 
   MachineBasicBlock *Header = Loop->getHeader();
   MachineBasicBlock *Latch = Loop->getLoopLatch();
+  debugPrintLoopInfo(MF, Header, "Examining");
+
   // Check if the loop has a conditional branch back edge
   // Note: The conditional branch might not be the last instruction if there's
   // also an unconditional branch to the exit block
@@ -210,8 +215,6 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         if (isPostIndex) {
           // Count post-index operations twice (weight = 2)
           ++LoopCount;
-          LLVM_DEBUG(dbgs() << "  Found post-index memory operation, counting twice: "
-                           << MI);
         }
       }
 
@@ -223,8 +226,6 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         // Found a control flow instruction that's not a terminator - skip this
         // loop
         InternalBranches.push_back(&MI);
-        LLVM_DEBUG(dbgs() << "  Loop has internal control flow instruction "
-                             "(branch/call/return), skipping\n");
         break;
       }
 
@@ -248,8 +249,6 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
             OpcodeName.contains_insensitive("ldeor") ||
             OpcodeName.contains_insensitive("ldset")) {
           hasAtomicOps = true;
-          LLVM_DEBUG(dbgs() << "  Loop contains atomic/exclusive operations, "
-                               "skipping unrolling\n");
           break;
         }
 
@@ -257,8 +256,6 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         for (MachineMemOperand *MMO : MI.memoperands()) {
           if (MMO->isAtomic()) {
             hasAtomicOps = true;
-            LLVM_DEBUG(dbgs() << "  Loop contains atomic memory operations, "
-                                 "skipping unrolling\n");
             break;
           }
         }
@@ -273,6 +270,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   Loop->getLoopLatches(Latches);
   if (Latches.size() != 1) {
     ++NumInnerLoopsNotSingleLatch;
+    LLVM_DEBUG(dbgs() << "  skipping: Not single latch\n");
     return Changed;
   }
 
@@ -280,6 +278,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   MachineBasicBlock::iterator LastIter = Latch->getLastNonDebugInstr();
   if (LastIter == Latch->end()) {
     ++NumInnerLoopsNoNonDebugInsts;
+    LLVM_DEBUG(dbgs() << "  skipping: No non-debug instructions\n");
     return Changed; // No non-debug instructions
   }
   MachineInstr *Last = &*LastIter;
@@ -287,6 +286,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   // Check if there is exactly one terminator and it's unconditional
   if (Latch->getFirstTerminator() != LastIter) {
     ++NumInnerLoopsMultipleTerminators;
+    LLVM_DEBUG(dbgs() << "  skipping: Multiple terminators\n");
     return Changed; // multiple terminators
   }
 
@@ -298,42 +298,76 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     // Sub-case: check if there's a single internal conditional branch
     if (InternalBranches.size() == 1 && InternalBranches[0]->isConditionalBranch())
       ++NumInnerLoopsBranchUnconditionalWithSingleCondInternal;
+    LLVM_DEBUG(dbgs() << "  skipping: Unconditional branch\n");
     return Changed;
   }
   if (Last->isIndirectBranch()) {
     ++NumInnerLoopsBranchIndirect;
+    LLVM_DEBUG(dbgs() << "  skipping: Indirect branch\n");
     return Changed;
   }
   if (!hasConditionalBranch) {
     ++NumInnerLoopsBranchConditionalNoBackedge;
+    LLVM_DEBUG(dbgs() << "  skipping: Conditional branch without backedge\n");
     return Changed;
   }
 
   // Check if this is a single basic block loop (Head == Latch)
   if (!Header || !Latch || Header != Latch) {
     ++NumInnerLoopsNotSingleBB;
+    LLVM_DEBUG(dbgs() << "  skipping: Not single BB (Header != Latch)\n");
     return Changed;
   }
 
 #ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
   if (hasAtomicOps) {
     ++NumInnerLoopsHasAtomicOps;
+    LLVM_DEBUG(dbgs() << "  skipping: Has atomic ops\n");
     return Changed;
   }
 #endif
 
   if (!InternalBranches.empty()) {
     ++NumInnerLoopsHasInternalBranch;
+    LLVM_DEBUG(dbgs() << "  skipping: Has internal branch\n");
     return Changed;
   }
 
   if (LoopCount >= LoopUnrollASMMaxInsts) {
     ++NumInnerLoopsTooManyInsts;
+    LLVM_DEBUG(dbgs() << "  skipping: Too many instructions (" << LoopCount << " >= " << LoopUnrollASMMaxInsts << ")\n");
     return Changed;
   }
 
   // Process the tight loop
   return processTightLoop(Loop, MF, Header, LoopCount);
+}
+
+void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
+                                       MachineBasicBlock *Header,
+                                       StringRef Prefix) {
+  // Get debug location information
+  DebugLoc DL;
+  for (MachineInstr &MI : *Header) {
+    if (!MI.isDebugInstr() && MI.getDebugLoc()) {
+      DL = MI.getDebugLoc();
+      break;
+    }
+  }
+
+  LLVM_DEBUG({
+    dbgs() << Prefix << " loop in function " << MF.getName() << "\n";
+    if (DL) {
+      dbgs() << "  Source location: ";
+      if (DL.getLine() != 0) {
+        auto *Scope = cast<DIScope>(DL.getScope());
+        dbgs() << Scope->getFilename() << ":" << DL.getLine();
+        if (DL.getCol() != 0)
+          dbgs() << ":" << DL.getCol();
+      }
+      dbgs() << "\n";
+    }
+  });
 }
 
 // processTightLoop() targets certain loops that meet these conditions:
@@ -347,30 +381,9 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                                      MachineBasicBlock *Header,
                                      unsigned LoopCount) {
-  // Get debug location information
-  DebugLoc DL;
-  for (MachineInstr &MI : *Header) {
-    if (!MI.isDebugInstr() && MI.getDebugLoc()) {
-      DL = MI.getDebugLoc();
-      break;
-    }
-  }
+  debugPrintLoopInfo(MF, Header, "Found qualifying");
 
-  LLVM_DEBUG({
-    dbgs() << "Found qualifying loop in function " << MF.getName() << "\n";
-    if (DL) {
-      dbgs() << "  Source location: ";
-      if (DL.getLine() != 0) {
-        auto *Scope = cast<DIScope>(DL.getScope());
-        dbgs() << Scope->getFilename() << ":" << DL.getLine();
-        if (DL.getCol() != 0)
-          dbgs() << ":" << DL.getCol();
-      }
-      dbgs() << "\n";
-    }
-    dbgs() << "  Loop count: " << LoopCount << "\n";
-    dbgs() << "  Loop header: BB#" << Header->getNumber() << "\n";
-  });
+  LLVM_DEBUG(dbgs() << "  Loop count: " << LoopCount << "\n");
 
 #if 0
   // Insert NOP at the beginning of the loop
@@ -472,10 +485,6 @@ unsigned LoopUnrollASM::findBestUnrollCount(unsigned LoopCount,
 
     // Calculate new bubbles for this unroll count
     unsigned NewBubbles = calculateBubbles(NewLoopCount);
-    LLVM_DEBUG(dbgs() << "  findBestUnrollCount UC=" << UC
-                      << " NewBubbles=" << NewBubbles << " Bubbles=" << Bubbles
-                      << " LoopCount=" << LoopCount << "\n");
-
     // Update best unroll count if we found fewer bubbles
     if (NewBubbles < Bubbles) {
       BestUC = UC;
