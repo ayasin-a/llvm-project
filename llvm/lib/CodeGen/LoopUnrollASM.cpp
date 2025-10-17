@@ -44,7 +44,7 @@ STATISTIC(NumInnerLoopsMultipleTerminators2, "Number of inner loops skipped (2 t
 STATISTIC(NumInnerLoopsMultipleTerminators3, "Number of inner loops skipped (3 terminators)");
 STATISTIC(NumInnerLoopsMultipleTerminators4Plus, "Number of inner loops skipped (4+ terminators)");
 STATISTIC(NumInnermostLoops, "Number of inner loops skipped (not innermost)");
-STATISTIC(NumInnerLoopsNoNonDebugInsts, "Number of inner loops skipped (no non-debug instructions)");
+STATISTIC(NumInnerLoopsInvalidTerminator, "Number of inner loops skipped (invalid terminator instruction)");
 STATISTIC(NumInnerLoopsBranchUnconditional, "Number of inner loops skipped (unconditional branch)");
 STATISTIC(NumInnerLoopsBranchUnconditionalWithSingleCondInternal, "Number of inner loops skipped (unconditional branch with single conditional internal)");
 STATISTIC(NumInnerLoopsBranchIndirect, "Number of inner loops skipped (indirect branch)");
@@ -288,7 +288,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 
   MachineBasicBlock::iterator LastIter = Latch->getLastNonDebugInstr();
   if (LastIter == Latch->end()) {
-    ++NumInnerLoopsNoNonDebugInsts;
+    ++NumInnerLoopsInvalidTerminator;
     LLVM_DEBUG(dbgs() << "  skipping: No non-debug instructions\n");
     return Changed; // No non-debug instructions
   }
@@ -366,7 +366,13 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     }
   }
 
-  assert(Last->isBranch() && "Last instruction must be a branch");
+  // Check if the last instruction is actually a branch
+  // In some cases (e.g., when there are no terminators), Last may not be a branch
+  if (!Last->isBranch()) {
+    ++NumInnerLoopsInvalidTerminator;
+    LLVM_DEBUG(dbgs() << "  skipping: Last instruction is not a branch\n");
+    return Changed;
+  }
 
   // Classify the branch type and skip if not suitable for unrolling
   if (!BackedgeCondBranch && Last->isUnconditionalBranch()) {
