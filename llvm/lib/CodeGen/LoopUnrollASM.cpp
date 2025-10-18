@@ -162,7 +162,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   // Note: The conditional branch might not be the last instruction if there's
   // also an unconditional branch to the exit block
   MachineInstr *BackedgeCondBranch = nullptr;
-  for (auto I = Latch->rbegin(); I != Latch->rend(); ++I) {
+  for (auto I = Header->rbegin(); I != Header->rend(); ++I) {
     if (I->isDebugInstr())
       continue;
     if (I->isConditionalBranch()) {
@@ -329,7 +329,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     else
       dbgs() << "none\n";
     for (auto T: Terminators)
-      dbgs() << "   Cond=" << T->isConditionalBranch() << " branchTargetsExit=" << branchTargetsExit(T) << "\n";
+      dbgs() << "    info: Cond=" << T->isConditionalBranch() << " branchTargetsExit=" << branchTargetsExit(T) << "\n";
   });
   if (NumTerminators == 2 && BackedgeCondBranch &&
       Terminators[0]->isConditionalBranch() && branchTargetsExit(Terminators[0])) {
@@ -706,12 +706,7 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
     }
   }
 
-  LLVM_DEBUG({
-    dbgs() << "  Duplicated loop body with unroll factor " << UnrollFactor
-           << "\n";
-    dbgs() << "  Created " << NewBlocks.size() << " new basic blocks\n";
-    dbgs() << "  Exit block: BB#" << ExitBlock->getNumber() << "\n";
-  });
+  LLVM_DEBUG(dbgs() << "  Duplicated loop body with unroll factor " << UnrollFactor << "\n");
 }
 
 FunctionPass *llvm::createLoopUnrollASMPass() {
