@@ -351,19 +351,19 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       Pattern = Two_Backedge_Uncond;
       LLVM_DEBUG(dbgs() << "  Detected two-terminator pattern (cond + uncond)\n");
     }
+  }
 
-    if (Pattern == Nonsupported) {
-      ++NumInnerLoopsMultipleTerminators;
-      // Increment the specific counter based on number of terminators
-      if (NumTerminators == 2)
-        ++NumInnerLoopsMultipleTerminators2;
-      else if (NumTerminators == 3)
-        ++NumInnerLoopsMultipleTerminators3;
-      else if (NumTerminators >= 4)
-        ++NumInnerLoopsMultipleTerminators4Plus;
-      LLVM_DEBUG(dbgs() << "  skipping: Multiple terminators (" << NumTerminators << ", not accepted pattern)\n");
-      return Changed;
-    }
+  if (Pattern == Nonsupported) {
+    ++NumInnerLoopsMultipleTerminators;
+    // Increment the specific counter based on number of terminators
+    if (NumTerminators == 2)
+      ++NumInnerLoopsMultipleTerminators2;
+    else if (NumTerminators == 3)
+      ++NumInnerLoopsMultipleTerminators3;
+    else if (NumTerminators >= 4)
+      ++NumInnerLoopsMultipleTerminators4Plus;
+    LLVM_DEBUG(dbgs() << "  skipping: Multiple terminators (" << NumTerminators << ", not accepted pattern)\n");
+    return Changed;
   }
 
   // Check if the last instruction is actually a branch
