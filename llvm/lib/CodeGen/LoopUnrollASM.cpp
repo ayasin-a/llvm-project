@@ -583,7 +583,8 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   for (MachineBasicBlock *MBB : Loop->blocks()) {
     for (MachineInstr &MI : *MBB) {
       // Skip PHI nodes, debug instructions, and the backedge branch
-      if (!MI.isPHI() && !MI.isDebugInstr() && &MI != BackedgeCondBranch)
+      if (!MI.isPHI() && !MI.isDebugInstr() && 
+          !MI.isTerminator()) //&MI != BackedgeCondBranch)
         InstsToClone.push_back(&MI);
     }
   }
