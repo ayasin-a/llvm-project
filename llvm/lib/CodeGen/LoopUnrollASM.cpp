@@ -96,15 +96,16 @@ private:
 
   void debugPrintLoopInfo(MachineFunction &MF, MachineBasicBlock *Header,
                           StringRef Prefix);
+  MachineInstr* findLoopBackedgeBranch(const MachineLoop* Loop);
   bool processLoop(MachineLoop *Loop, MachineFunction &MF);
   bool processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                         MachineBasicBlock *Header, unsigned LoopCount,
-                        TerminatorPattern Pattern, MachineInstr *BackedgeCondBranch);
+                        TerminatorPattern Pattern, MachineInstr *BackedgeBranch);
   unsigned findBestUnrollCount(unsigned LoopCount, unsigned Bubbles,
                                unsigned MachineWidth);
   void duplicateLoopBody(MachineLoop *Loop, unsigned UnrollFactor,
                          const SmallVectorImpl<MachineOperand> &InvertedCond,
-                         MachineInstr *BackedgeCondBranch);
+                         MachineInstr *BackedgeBranch);
 };
 } // end anonymous namespace
 
@@ -129,6 +130,107 @@ bool LoopUnrollASM::runOnMachineFunction(MachineFunction &MF) {
   }
 
   return Changed;
+}
+
+/// Find the backedge branch instruction for a given machine loop
+/// Returns nullptr if no backedge branch is found or if the loop structure is invalid
+MachineInstr* LoopUnrollASM::findLoopBackedgeBranch(const MachineLoop* Loop) {
+  assert(Loop);
+  MachineBasicBlock* Header = Loop->getHeader();
+  assert(Header);
+
+  // Find all backedge blocks (blocks in the loop that branch back to header)
+  SmallVector<MachineBasicBlock*, 4> BackedgeBlocks;
+  for (MachineBasicBlock* Block : Loop->blocks())
+    // Check if this block has a successor that is the loop header
+    for (MachineBasicBlock* Succ : Block->successors())
+      if (Succ == Header) {
+        BackedgeBlocks.push_back(Block);
+        break; // A block can only have one edge to the header
+      }
+  if (BackedgeBlocks.empty()) {
+    LLVM_DEBUG(dbgs() << "Warning: No backedge blocks found for loop\n");
+    return nullptr;
+  }
+
+  // Handle multiple backedge blocks (choose the one with highest execution frequency
+  // or use heuristics to pick the "main" backedge)
+  MachineBasicBlock* MainBackedgeBlock = nullptr;
+  if (BackedgeBlocks.size() == 1) {
+    MainBackedgeBlock = BackedgeBlocks[0];
+  } else {
+    // Multiple backedges - use heuristics to find the main one
+    // Prefer the block that:
+    // 1. Is a latch block (if available)
+    // 2. Has the highest block frequency (if profile info available)
+    // 3. Is the lexicographically last block (fallback)
+
+    MachineBasicBlock* Latch = Loop->getLoopLatch();
+    if (Latch && llvm::find(BackedgeBlocks, Latch) != BackedgeBlocks.end()) {
+      MainBackedgeBlock = Latch;
+    } else {
+      // Fallback: choose the last backedge block
+      MainBackedgeBlock = BackedgeBlocks.back();
+      LLVM_DEBUG(dbgs() << "Warning: Multiple backedge blocks, choosing block "
+                        << MainBackedgeBlock->getNumber() << "\n");
+    }
+  }
+  if (!MainBackedgeBlock) {
+    return nullptr;
+  }
+
+  // Find the terminating branch instruction in the backedge block
+  MachineInstr* BackedgeBranch = nullptr;
+  // Look for the last branching instruction in the block
+  for (auto I = MainBackedgeBlock->rbegin(); I != MainBackedgeBlock->rend(); ++I) {
+    MachineInstr& MI = *I;
+
+    if (!MI.isBranch())
+      continue;
+
+    // Verify this branch actually targets the loop header
+    bool BranchesToHeader = false;
+
+    if (MI.isUnconditionalBranch()) {
+      // For unconditional branches, check if it targets the header
+      for (const MachineOperand& MO : MI.operands()) {
+        if (MO.isMBB() && MO.getMBB() == Header) {
+          BranchesToHeader = true;
+          break;
+        }
+      }
+    } else if (MI.isConditionalBranch()) {
+      // For conditional branches, check if one of the targets is the header
+      for (const MachineOperand& MO : MI.operands()) {
+        if (MO.isMBB() && MO.getMBB() == Header) {
+          BranchesToHeader = true;
+          break;
+        }
+      }
+
+      // Also check fall-through case
+      if (!BranchesToHeader) {
+        MachineBasicBlock* FallThrough = MainBackedgeBlock->getNextNode();
+        if (FallThrough == Header) {
+          BranchesToHeader = true;
+        }
+      }
+    }
+
+    if (BranchesToHeader) {
+      BackedgeBranch = &MI;
+      break;
+    }
+  }
+
+  if (!BackedgeBranch) {
+    LLVM_DEBUG(dbgs() << "Warning: No branch instruction found that targets loop header\n");
+    return nullptr;
+  }
+
+  LLVM_DEBUG(dbgs() << "  info: main backedge branch: " << *BackedgeBranch);
+
+  return BackedgeBranch;
 }
 
 bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
@@ -158,32 +260,10 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
   assert(Latch == Latches[0]);
 
-  // Check if the loop has a conditional branch back edge
-  // Note: The conditional branch might not be the last instruction if there's
-  // also an unconditional branch to the exit block
-  MachineInstr *BackedgeCondBranch = nullptr;
-  for (auto I = Header->rbegin(); I != Header->rend(); ++I) {
-    if (I->isDebugInstr())
-      continue;
-    if (I->isConditionalBranch()) {
-      // Check if this conditional branch targets the loop header
-      for (MachineOperand &MO : I->operands()) {
-        if (MO.isMBB() && MO.getMBB() == Header) {
-          BackedgeCondBranch = &*I;
-          break;
-        }
-      }
-      if (BackedgeCondBranch)
-        break;
-    }
-    // Stop looking after we've seen all terminators
-    if (!I->isTerminator())
-      break;
-  }
-
   // Count instructions in the loop and check for internal branches
   // We want to skip loops that have branches within the loop body
   // (excluding the terminator back-edge branch)
+  MachineInstr *BackedgeBranch = findLoopBackedgeBranch(Loop);
   unsigned LoopCount = 0;
   SmallVector<MachineInstr *, 4> InternalBranches;
 #ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
@@ -324,14 +404,14 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   // Pattern: One conditional exit branch + One conditional backedge = Two_CondExit_Backedge
   LLVM_DEBUG({dbgs() << "  info: NumTerminators=" << NumTerminators
                      << " Backedge=";
-    if (BackedgeCondBranch)
-      BackedgeCondBranch->print(dbgs());
+    if (BackedgeBranch)
+      BackedgeBranch->print(dbgs());
     else
       dbgs() << "none\n";
     for (auto T: Terminators)
       dbgs() << "    info: Cond=" << T->isConditionalBranch() << " branchTargetsExit=" << branchTargetsExit(T) << "\n";
   });
-  if (NumTerminators == 2 && BackedgeCondBranch &&
+  if (NumTerminators == 2 && BackedgeBranch &&
       Terminators[0]->isConditionalBranch() && branchTargetsExit(Terminators[0])) {
     Pattern = Two_CondExit_Backedge;
     NumInnerLoopsBranchConditionalCondExit++;
@@ -340,6 +420,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
 
   // Check for backedge conditional followed by unconditional exit in the Latch block
+  // TODO: tweak the loop_with_cond_uncond_pattern to be detected here (avoid Branch Folding optimization)
   MachineBasicBlock::iterator FirstTermIter = Latch->getFirstTerminator();
   if (FirstTermIter != LastIter) {
     auto SecondTermIter = std::next(FirstTermIter);
@@ -366,6 +447,12 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     return Changed;
   }
 
+  if (!BackedgeBranch) {
+    ++NumInnerLoopsBranchConditionalNoBackedge;
+    LLVM_DEBUG(dbgs() << "  skipping: Loop has no backedge branch\n");
+    return Changed;
+  }
+
   // Check if the last instruction is actually a branch
   // In some cases (e.g., when there are no terminators), Last may not be a branch
   if (!Last->isBranch()) {
@@ -375,7 +462,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
 
   // Classify the branch type and skip if not suitable for unrolling
-  if (!BackedgeCondBranch && Last->isUnconditionalBranch()) {
+  if (BackedgeBranch->isUnconditionalBranch()) {
     ++NumInnerLoopsBranchUnconditional;
     // Sub-case: check if there's a single internal conditional branch
     if (InternalBranches.size() == 1 && InternalBranches[0]->isConditionalBranch())
@@ -383,19 +470,13 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     LLVM_DEBUG(dbgs() << "  skipping: Unconditional branch\n");
     return Changed;
   }
+
   if (Last->isIndirectBranch()) {
     ++NumInnerLoopsBranchIndirect;
     LLVM_DEBUG(dbgs() << "  skipping: Indirect branch\n");
     return Changed;
   }
-
-  // For two-terminator pattern, we already know we have a conditional branch
-  // For single-terminator, we need to verify it's conditional with backedge
-  if (!BackedgeCondBranch) {
-    ++NumInnerLoopsBranchConditionalNoBackedge;
-    LLVM_DEBUG(dbgs() << "  skipping: Conditional branch without backedge\n");
-    return Changed;
-  }
+  assert(BackedgeBranch->isConditionalBranch() && "Loop with non-conditional backedge branch!");
 
   // Check if this is a single basic block loop (Head == Latch)
   if (!Header || !Latch || Header != Latch) {
@@ -429,7 +510,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   unsigned AdjustedLoopCount = (Pattern == Two_Backedge_Uncond) ? LoopCount - 1 : LoopCount;
 
   // Process the tight loop
-  return processTightLoop(Loop, MF, Header, AdjustedLoopCount, Pattern, BackedgeCondBranch);
+  return processTightLoop(Loop, MF, Header, AdjustedLoopCount, Pattern, BackedgeBranch);
 }
 
 void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
@@ -470,7 +551,7 @@ void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
 bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                                      MachineBasicBlock *Header,
                                      unsigned LoopCount, TerminatorPattern Pattern,
-                                     MachineInstr *BackedgeCondBranch) {
+                                     MachineInstr *BackedgeBranch) {
   LLVM_DEBUG({debugPrintLoopInfo(MF, Header, "Found qualifying");
     dbgs() << "  with Loop count: " << LoopCount << "\n";});
 
@@ -509,7 +590,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
         findBestUnrollCount(LoopCount, Bubbles, MachineWidth);
 
     // Duplicate the loop body with the calculated unroll factor
-    duplicateLoopBody(Loop, UnrollFactor, InvertedCond, BackedgeCondBranch);
+    duplicateLoopBody(Loop, UnrollFactor, InvertedCond, BackedgeBranch);
     ++NumLoopsUnrolled;
     if (Pattern == Two_Backedge_Uncond) {
       ++NumLoopsUnrolledCondUncond;
@@ -558,7 +639,7 @@ unsigned LoopUnrollASM::findBestUnrollCount(unsigned LoopCount,
 void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
                                       unsigned UnrollFactor,
                                       const SmallVectorImpl<MachineOperand> &InvertedCond,
-                                      MachineInstr *BackedgeCondBranch) {
+                                      MachineInstr *BackedgeBranch) {
   assert (UnrollFactor > 1);
 
   MachineBasicBlock *Header = Loop->getHeader();
@@ -583,8 +664,8 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   for (MachineBasicBlock *MBB : Loop->blocks()) {
     for (MachineInstr &MI : *MBB) {
       // Skip PHI nodes, debug instructions, and the backedge branch
-      if (!MI.isPHI() && !MI.isDebugInstr() && 
-          !MI.isTerminator()) //&MI != BackedgeCondBranch)
+      if (!MI.isPHI() && !MI.isDebugInstr() &&
+          !MI.isTerminator()) //&MI != BackedgeBranch)
         InstsToClone.push_back(&MI);
     }
   }
@@ -658,11 +739,11 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
       if (CurrentBlock->isLayoutSuccessor(NextBlock)) {
         // Only insert conditional branch to exit, fall through to next block
         TII->insertBranch(*CurrentBlock, ExitBlock, nullptr, InvertedCond,
-                          BackedgeCondBranch->getDebugLoc());
+                          BackedgeBranch->getDebugLoc());
       } else {
         // Need both branches
         TII->insertBranch(*CurrentBlock, ExitBlock, NextBlock, InvertedCond,
-                          BackedgeCondBranch->getDebugLoc());
+                          BackedgeBranch->getDebugLoc());
       }
     } else {
       // For the last iteration, keep the original branch back to loop header
@@ -671,11 +752,11 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
       if (CurrentBlock->isLayoutSuccessor(ExitBlock)) {
         // Only insert conditional branch to header, fall through to exit
         TII->insertBranch(*CurrentBlock, Header, nullptr, Cond,
-                          BackedgeCondBranch->getDebugLoc());
+                          BackedgeBranch->getDebugLoc());
       } else {
         // Need both branches
         TII->insertBranch(*CurrentBlock, Header, ExitBlock, Cond,
-                          BackedgeCondBranch->getDebugLoc());
+                          BackedgeBranch->getDebugLoc());
       }
     }
   }
