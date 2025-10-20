@@ -658,6 +658,7 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   MachineBasicBlock *Header = Loop->getHeader();
   MachineFunction *MF = Header->getParent();
   const TargetInstrInfo *TII = MF->getSubtarget().getInstrInfo();
+  MachineBasicBlock *BackedgeBlock = BackedgeBranch->getParent();
 
   // Find all exit blocks (successors that are outside the loop)
   SmallVector<MachineBasicBlock*, 4> ExitBlocks;
@@ -687,16 +688,18 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   for (MachineBasicBlock *MBB : LoopBlocksInOrder) {
     SmallVector<MachineInstr *, 16> &BlockInsts = InstsToClone[MBB];
     for (MachineInstr &MI : *MBB) {
-      // for Two_Backedge_Uncond, skip cloning the Unconditional too.
-      const bool CloneBranch = Pattern == Multi_CondExit_Backedge ? &MI != BackedgeBranch : !MI.isTerminator();
-      // Skip PHI nodes, debug instructions, and the backedge branch
-      if (!MI.isPHI() && !MI.isDebugInstr() && CloneBranch)
-        BlockInsts.push_back(&MI);
+      // Skip PHI nodes and debug instructions
+      if (MI.isPHI() || MI.isDebugInstr())
+        continue;
+
+      // For the backedge block, skip terminators (we'll insert new ones)
+      // For other blocks, include terminators (they need to be cloned)
+      if (MI.isTerminator() && MBB == BackedgeBlock)
+        continue;
+
+      BlockInsts.push_back(&MI);
     }
   }
-
-  // Find which block contains the backedge branch
-  MachineBasicBlock *BackedgeBlock = BackedgeBranch->getParent();
 
   // Analyze the branch in the backedge block to extract condition
   SmallVector<MachineOperand, 4> Cond;
@@ -750,16 +753,8 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
     unsigned BlockIdx = 0;
     // For each original loop block in layout order, process the corresponding block in this iteration
     for (MachineBasicBlock *OrigMBB : LoopBlocksInOrder) {
-      MachineBasicBlock *CurrentBlock;
-      bool isBackedgeBlock = (OrigMBB == BackedgeBlock); // This block has the backedge branch
-
-      if (i == 0) {
-        // First iteration uses the original blocks
-        CurrentBlock = OrigMBB;
-      } else {
-        // Subsequent iterations use the cloned blocks
-        CurrentBlock = NewBlocks[i - 1][BlockIdx];
-
+      MachineBasicBlock *CurrentBlock = (i == 0) ? OrigMBB : NewBlocks[i - 1][BlockIdx];
+      if  (i>0) {
         // Clone body instructions into the new block
         for (MachineInstr *MI : InstsToClone[OrigMBB]) {
           MachineInstr *ClonedMI = MF->CloneMachineInstr(MI);
@@ -767,8 +762,10 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
         }
       }
 
-      // Insert appropriate branch for the backedge block in each iteration
-      if (isBackedgeBlock) {
+      // Only insert branches for the backedge block
+      // For Multi_CondExit_Backedge pattern, other blocks keep their original terminators
+      if (OrigMBB == BackedgeBlock) {
+        // Insert appropriate branch for the backedge block in each iteration
         if (i < UnrollFactor - 1) {
           // For all but the last iteration, use the inverted conditional branch
           // Branch to exit on condition, or continue to next iteration's first block
@@ -800,7 +797,7 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
       }
 
       BlockIdx++;
-    }
+    } // for LoopBlocksInOrder
   }
 
   // Update the CFG - fix successor relationships
