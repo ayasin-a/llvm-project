@@ -817,10 +817,11 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   for (unsigned i = 0; i < NewBlocks.size(); ++i) {
     for (unsigned j = 0; j < NewBlocks[i].size(); ++j) {
       MachineBasicBlock *BB = NewBlocks[i][j];
+      MachineBasicBlock *OrigMBB = LoopBlocksInOrder[j];
       bool isLastBlockInIteration = (j == NewBlocks[i].size() - 1);
 
       if (isLastBlockInIteration) {
-        // Last block in iteration can exit
+        // Last block in iteration (backedge block) can exit
         if (!BB->isSuccessor(ExitBlock))
           BB->addSuccessor(ExitBlock);
 
@@ -834,8 +835,25 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
             BB->addSuccessor(Header);
         }
       } else {
-        // Non-last blocks within an iteration may need internal successors
-        // but these are typically handled by fall-through or existing branches
+        // Non-last blocks within an iteration need their successors set up
+        // These blocks may have conditional exits and internal successors
+        for (MachineBasicBlock *OrigSucc : OrigMBB->successors()) {
+          if (!Loop->contains(OrigSucc)) {
+            // External successor (exit block) - keep as is
+            if (!BB->isSuccessor(OrigSucc))
+              BB->addSuccessor(OrigSucc);
+          } else {
+            // Internal successor - need to map to the corresponding block in this iteration
+            // Find the index of the successor in the loop blocks
+            auto It = llvm::find(LoopBlocksInOrder, OrigSucc);
+            if (It != LoopBlocksInOrder.end()) {
+              unsigned SuccIdx = std::distance(LoopBlocksInOrder.begin(), It);
+              MachineBasicBlock *NewSucc = NewBlocks[i][SuccIdx];
+              if (!BB->isSuccessor(NewSucc))
+                BB->addSuccessor(NewSucc);
+            }
+          }
+        }
       }
     }
   }
