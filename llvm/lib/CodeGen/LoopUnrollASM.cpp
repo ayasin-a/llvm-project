@@ -688,7 +688,7 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
     SmallVector<MachineInstr *, 16> &BlockInsts = InstsToClone[MBB];
     for (MachineInstr &MI : *MBB) {
       // for Two_Backedge_Uncond, skip cloning the Unconditional too.
-      const bool CloneBranch = Pattern == Two_Backedge_Uncond ? !MI.isTerminator() : &MI != BackedgeBranch;
+      const bool CloneBranch = Pattern == Multi_CondExit_Backedge ? &MI != BackedgeBranch : !MI.isTerminator();
       // Skip PHI nodes, debug instructions, and the backedge branch
       if (!MI.isPHI() && !MI.isDebugInstr() && CloneBranch)
         BlockInsts.push_back(&MI);
