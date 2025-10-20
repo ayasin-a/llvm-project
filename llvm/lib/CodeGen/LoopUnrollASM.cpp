@@ -271,7 +271,8 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   bool hasAtomicOps = false;
 #endif
 
-  // Iterate over all blocks in the loop
+  // Calculate a precise LoopCount based on the loop size (in # fetch slots)
+  // TODO: this should eventually interface with TTI
   for (MachineBasicBlock *MBB : Loop->blocks()) {
     for (MachineInstr &MI : *MBB) {
       // Skip debug instructions and pseudo instructions
@@ -567,6 +568,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
 
   ++NumLoopsDetected;
 
+  // TODO: get MachineWidth from TTI / SchedModel
   const unsigned MachineWidth = 10;
   const unsigned LoopCycles =
       (LoopCount + MachineWidth - 1) / MachineWidth; // round-up int divide
@@ -685,8 +687,10 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   for (MachineBasicBlock *MBB : LoopBlocksInOrder) {
     SmallVector<MachineInstr *, 16> &BlockInsts = InstsToClone[MBB];
     for (MachineInstr &MI : *MBB) {
+      // for Two_Backedge_Uncond, skip cloning the Unconditional too.
+      const bool CloneBranch = Pattern == Two_Backedge_Uncond ? !MI.isTerminator() : &MI != BackedgeBranch;
       // Skip PHI nodes, debug instructions, and the backedge branch
-      if (!MI.isPHI() && !MI.isDebugInstr() && &MI != BackedgeBranch)
+      if (!MI.isPHI() && !MI.isDebugInstr() && CloneBranch)
         BlockInsts.push_back(&MI);
     }
   }
