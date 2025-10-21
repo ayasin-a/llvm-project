@@ -471,7 +471,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     for (const MachineOperand &MO : MI->operands()) {
       if (MO.isMBB()) {
         MachineBasicBlock *Target = MO.getMBB();
-        // TODO: there is a bug here; this actually check the branch targets something outside loop!!
+        // TODO: a bug; this actually checks the branch targets something outside loop!!
         if (Target != Header && !Loop->contains(Target))
           return true;
       }
@@ -698,7 +698,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
 
   unsigned Bubbles = calculateBubbles(LoopCount);
   // Hanlde the case if the loop would possibly induce +20% Frontend Bound
-  if (Bubbles / float(MachineWidth * LoopCycles) > 0.2f) {
+  if (Bubbles / float(MachineWidth * LoopCycles) > 0.15f) {
     // First, we need to analyze the loop branch to see if we can invert it
     const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
 
@@ -999,10 +999,6 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
 
   LLVM_DEBUG(dbgs() << "  Duplicated loop body with unroll factor " << UnrollFactor << "\n");
 
-  // Two_Backedge_Uncond may not meet instruction-count verification
-  if (Backedge.Pattern == Two_Backedge_Uncond)
-    return;
-
   // Verify instruction count matches expectations
   unsigned NewLoopInstCount = 0;
   for (MachineBasicBlock *MBB : Loop->blocks()) {
@@ -1014,6 +1010,8 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   }
 
   unsigned ExpectedInstCount = UnrollFactor * TotalInsts;
+  if (Backedge.Pattern == Two_Backedge_Uncond)
+    ExpectedInstCount++;
   if (NewLoopInstCount != ExpectedInstCount) {
     dbgs() << "ERROR: Instruction count mismatch after loop unrolling!\n";
     dbgs() << "  Pattern: " << Backedge.Pattern << "\n";
