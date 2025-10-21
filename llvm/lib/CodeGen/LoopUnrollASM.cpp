@@ -801,15 +801,55 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   }
 
   // Update the CFG - fix successor relationships
+  // NewBlocks cannot be empty here since UnrollFactor > 1
+  assert(!NewBlocks.empty() && "NewBlocks should not be empty when UnrollFactor > 1");
+
   // First update the backedge block's successors (last block of first iteration)
-  if (!NewBlocks.empty()) {
-    // Backedge block now branches to either first block of second iteration or exit
-    // Remove self-loop to header if it exists (only for single-block loops where backedge is in header)
-    if (BackedgeBlock->isSuccessor(Header))
-      BackedgeBlock->removeSuccessor(Header);
-    if (!BackedgeBlock->isSuccessor(NewBlocks[0][0]))
-      BackedgeBlock->addSuccessor(NewBlocks[0][0]);
-    // ExitBlock successor should already be there
+  // Backedge block now branches to either first block of second iteration or exit
+  // Remove self-loop to header if it exists (only for single-block loops where backedge is in header)
+  if (BackedgeBlock->isSuccessor(Header))
+    BackedgeBlock->removeSuccessor(Header);
+  if (!BackedgeBlock->isSuccessor(NewBlocks[0][0]))
+    BackedgeBlock->addSuccessor(NewBlocks[0][0]);
+  // ExitBlock successor should already be there
+
+  // For Multi_CondExit_Backedge pattern, update successors for original non-backedge blocks
+  // These blocks keep their terminators but need CFG successors updated to point to
+  // duplicated blocks in the first unrolled iteration
+  if (Pattern == Multi_CondExit_Backedge) {
+    for (unsigned j = 0; j < LoopBlocksInOrder.size(); ++j) {
+      MachineBasicBlock *OrigMBB = LoopBlocksInOrder[j];
+
+      // Skip the backedge block (already handled above)
+      if (OrigMBB == BackedgeBlock)
+        continue;
+
+      // For non-backedge blocks in the original iteration, update their successors
+      // to point to the corresponding blocks in the first duplicated iteration
+      SmallVector<MachineBasicBlock *, 4> OldSuccessors(OrigMBB->successors().begin(),
+                                                         OrigMBB->successors().end());
+      for (MachineBasicBlock *OrigSucc : OldSuccessors) {
+        if (Loop->contains(OrigSucc)) {
+          // Internal successor - need to map to the corresponding block in first duplicated iteration
+          auto It = llvm::find(LoopBlocksInOrder, OrigSucc);
+          if (It != LoopBlocksInOrder.end()) {
+            unsigned SuccIdx = std::distance(LoopBlocksInOrder.begin(), It);
+            MachineBasicBlock *NewSucc = NewBlocks[0][SuccIdx];
+            LLVM_DEBUG(dbgs() << "  CFG:" <<
+              "\tOrigMBB name=" << OrigMBB->getSymbol()->getName() << " num=" << OrigMBB->getNumber() << "\n"
+              "\tOrigSucc name=" << OrigSucc->getSymbol()->getName() << " num=" << OrigSucc->getNumber() << "\n"
+              "\tNewSucc name=" << NewSucc->getSymbol()->getName() << " num=" << NewSucc->getNumber() << "\n"
+            );
+
+            // Remove old internal successor and add new one
+            OrigMBB->removeSuccessor(OrigSucc);
+            if (!OrigMBB->isSuccessor(NewSucc))
+              OrigMBB->addSuccessor(NewSucc);
+          }
+        }
+        // External successors (exit blocks) are kept as-is
+      }
+    }
   }
 
   // Now add successors for the new iteration blocks
