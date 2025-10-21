@@ -54,6 +54,7 @@ STATISTIC(NumInnerLoopsNotSingleBB, "Number of inner loops skipped (Header != La
 STATISTIC(NumInnerLoopsHasAtomicOps, "Number of inner loops skipped (has atomic ops)");
 STATISTIC(NumInnerLoopsHasInternalBranch, "Number of inner loops skipped (has internal branch)");
 STATISTIC(NumInnerLoopsTooManyInsts, "Number of inner loops skipped (too many instructions)");
+STATISTIC(NumInnerLoopsExitNotFallthru, "Number of inner loops skipped (ExitBlock isn't fallthrough of BackedgeBlock)");
 STATISTIC(NumInnerLoopsCannotAnalyzeBranch, "Number of tight loops skipped (cannot analyze branch)");
 
 static cl::opt<unsigned> LoopUnrollASMMaxInsts(
@@ -67,6 +68,15 @@ enum TerminatorPattern {
   One_Backedge,
   Two_Backedge_Uncond,
   Multi_CondExit_Backedge
+};
+
+struct BackedgeInfo {
+  MachineInstr *Branch;
+  TerminatorPattern Pattern;
+  MachineBasicBlock *ExitBlock;
+
+  BackedgeInfo(MachineInstr *Branch, TerminatorPattern Pattern, MachineBasicBlock *ExitBlock)
+    : Branch(Branch), Pattern(Pattern), ExitBlock(ExitBlock) {}
 };
 
 class LoopUnrollASM : public MachineFunctionPass {
@@ -100,12 +110,12 @@ private:
   bool processLoop(MachineLoop *Loop, MachineFunction &MF);
   bool processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                         MachineBasicBlock *Header, unsigned LoopCount,
-                        TerminatorPattern Pattern, MachineInstr *BackedgeBranch);
+                        const BackedgeInfo &BEInfo);
   unsigned findBestUnrollCount(unsigned LoopCount, unsigned Bubbles,
                                unsigned MachineWidth);
   void duplicateLoopBody(MachineLoop *Loop, unsigned UnrollFactor,
                          const SmallVectorImpl<MachineOperand> &InvertedCond,
-                         MachineInstr *BackedgeBranch, TerminatorPattern Pattern);
+                         const BackedgeInfo &BEInfo);
 };
 } // end anonymous namespace
 
@@ -516,12 +526,35 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     return Changed;
   }
 
+  // Find all exit blocks (successors that are outside the loop)
+  SmallVector<MachineBasicBlock*, 4> ExitBlocks;
+  for (MachineBasicBlock *MBB : Loop->blocks()) {
+    for (MachineBasicBlock *Succ : MBB->successors()) {
+      if (!Loop->contains(Succ) &&
+          std::find(ExitBlocks.begin(), ExitBlocks.end(), Succ) == ExitBlocks.end()) {
+        ExitBlocks.push_back(Succ);
+      }
+    }
+  }
+  assert(!ExitBlocks.empty() && ExitBlocks.size() >= 1 && "Could not find loop exit block");
+  MachineBasicBlock *ExitBlock = ExitBlocks[0];
+  // For correct instruction counting, verify that ExitBlock is the fallthrough of BackedgeBlock
+  // This ensures we only insert one branch instruction (conditional) instead of two
+  if (!BackedgeBranch->getParent()->isLayoutSuccessor(ExitBlock)) {
+    ++NumInnerLoopsExitNotFallthru;
+    LLVM_DEBUG(dbgs() << "  skipping: ExitBlock is not the fallthrough successor of BackedgeBlock\n");
+    return Changed;
+  }
+
   // For Two_Backedge_Uncond pattern, decrement LoopCount since the unconditional
   // branch is not part of the actual loop body
   unsigned AdjustedLoopCount = (Pattern == Two_Backedge_Uncond) ? LoopCount - 1 : LoopCount;
 
+  // Create BackedgeInfo struct to pass to processTightLoop
+  BackedgeInfo BEInfo(BackedgeBranch, Pattern, ExitBlock);
+
   // Process the tight loop
-  return processTightLoop(Loop, MF, Header, AdjustedLoopCount, Pattern, BackedgeBranch);
+  return processTightLoop(Loop, MF, Header, AdjustedLoopCount, BEInfo);
 }
 
 void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
@@ -540,11 +573,12 @@ void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
     dbgs() << Prefix << " loop in function " << MF.getName() << "\n";
     if (DL) {
       dbgs() << "  Source location: ";
-      if (DL.getLine() != 0) {
-        auto *Scope = cast<DIScope>(DL.getScope());
-        dbgs() << Scope->getFilename() << ":" << DL.getLine();
-        if (DL.getCol() != 0)
-          dbgs() << ":" << DL.getCol();
+      if (DL.getLine() != 0 && DL.getScope()) {
+        if (auto *Scope = dyn_cast<DIScope>(DL.getScope())) {
+          dbgs() << Scope->getFilename() << ":" << DL.getLine();
+          if (DL.getCol() != 0)
+            dbgs() << ":" << DL.getCol();
+        }
       }
       dbgs() << "\n";
     }
@@ -561,8 +595,8 @@ void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
 // - Loop body has no atomic operations (ldxr/stxr, atomicrmw, etc.)
 bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                                      MachineBasicBlock *Header,
-                                     unsigned LoopCount, TerminatorPattern Pattern,
-                                     MachineInstr *BackedgeBranch) {
+                                     unsigned LoopCount,
+                                     const BackedgeInfo &BEInfo) {
   LLVM_DEBUG({debugPrintLoopInfo(MF, Header, "Found qualifying");
     dbgs() << "  with Loop count: " << LoopCount << "\n";});
 
@@ -583,7 +617,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     SmallVector<MachineOperand, 4> Cond;
     MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
 
-    if (TII->analyzeBranch(*BackedgeBranch->getParent(), TBB, FBB, Cond)) {
+    if (TII->analyzeBranch(*BEInfo.Branch->getParent(), TBB, FBB, Cond)) {
       LLVM_DEBUG(dbgs() << "  Could not analyze branch for unrolling\n");
       ++NumInnerLoopsCannotAnalyzeBranch;
       return false;
@@ -602,11 +636,11 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
         findBestUnrollCount(LoopCount, Bubbles, MachineWidth);
 
     // Duplicate the loop body with the calculated unroll factor
-    duplicateLoopBody(Loop, UnrollFactor, InvertedCond, BackedgeBranch, Pattern);
+    duplicateLoopBody(Loop, UnrollFactor, InvertedCond, BEInfo);
     ++NumLoopsUnrolled;
-    if (Pattern == Two_Backedge_Uncond) {
+    if (BEInfo.Pattern == Two_Backedge_Uncond) {
       ++NumLoopsUnrolledCondUncond;
-    } else if (Pattern == Multi_CondExit_Backedge) {
+    } else if (BEInfo.Pattern == Multi_CondExit_Backedge) {
       ++NumLoopsUnrolledMultiCondExit;
     }
     return true;
@@ -651,28 +685,19 @@ unsigned LoopUnrollASM::findBestUnrollCount(unsigned LoopCount,
 void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
                                       unsigned UnrollFactor,
                                       const SmallVectorImpl<MachineOperand> &InvertedCond,
-                                      MachineInstr *BackedgeBranch,
-                                      TerminatorPattern Pattern) {
+                                      const BackedgeInfo &BEInfo) {
   assert (UnrollFactor > 1);
 
   MachineLoopInfo &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
   MachineBasicBlock *Header = Loop->getHeader();
   MachineFunction *MF = Header->getParent();
   const TargetInstrInfo *TII = MF->getSubtarget().getInstrInfo();
-  MachineBasicBlock *BackedgeBlock = BackedgeBranch->getParent();
+  MachineBasicBlock *BackedgeBlock = BEInfo.Branch->getParent();
+  MachineBasicBlock *ExitBlock = BEInfo.ExitBlock;
 
-  // Find all exit blocks (successors that are outside the loop)
-  SmallVector<MachineBasicBlock*, 4> ExitBlocks;
-  for (MachineBasicBlock *MBB : Loop->blocks()) {
-    for (MachineBasicBlock *Succ : MBB->successors()) {
-      if (!Loop->contains(Succ) &&
-          std::find(ExitBlocks.begin(), ExitBlocks.end(), Succ) == ExitBlocks.end()) {
-        ExitBlocks.push_back(Succ);
-      }
-    }
-  }
-  assert(!ExitBlocks.empty() && ExitBlocks.size() >= 1 && "Could not find loop exit block");
-  MachineBasicBlock *ExitBlock = ExitBlocks[0];
+  // This ensures we only insert one branch instruction (conditional) instead of two
+  assert(BackedgeBlock->isLayoutSuccessor(ExitBlock) &&
+         "ExitBlock must be the fallthrough successor of BackedgeBlock for correct unrolling");
 
   // Collect all non-terminator instructions to duplicate from all loop blocks
   // Use a map to maintain per-block instruction lists for multi-block loops
@@ -776,11 +801,11 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
           if (CurrentBlock->isLayoutSuccessor(NextBlock)) {
             // Only insert conditional branch to exit, fall through to next block
             TII->insertBranch(*CurrentBlock, ExitBlock, nullptr, InvertedCond,
-                              BackedgeBranch->getDebugLoc());
+                              BEInfo.Branch->getDebugLoc());
           } else {
             // Need both branches
             TII->insertBranch(*CurrentBlock, ExitBlock, NextBlock, InvertedCond,
-                              BackedgeBranch->getDebugLoc());
+                              BEInfo.Branch->getDebugLoc());
           }
         } else {
           // For the last iteration, branch back to header with inverted condition
@@ -788,11 +813,11 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
           if (CurrentBlock->isLayoutSuccessor(ExitBlock)) {
             // Only insert conditional branch to header, fall through to exit
             TII->insertBranch(*CurrentBlock, Header, nullptr, Cond,
-                              BackedgeBranch->getDebugLoc());
+                              BEInfo.Branch->getDebugLoc());
           } else {
             // Need both branches
             TII->insertBranch(*CurrentBlock, Header, ExitBlock, Cond,
-                              BackedgeBranch->getDebugLoc());
+                              BEInfo.Branch->getDebugLoc());
           }
         }
       }
@@ -817,7 +842,7 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   // For Multi_CondExit_Backedge pattern, update successors for original non-backedge blocks
   // These blocks keep their terminators but need CFG successors updated to point to
   // duplicated blocks in the first unrolled iteration
-  if (Pattern == Multi_CondExit_Backedge) {
+  if (BEInfo.Pattern == Multi_CondExit_Backedge) {
     for (unsigned j = 0; j < LoopBlocksInOrder.size(); ++j) {
       MachineBasicBlock *OrigMBB = LoopBlocksInOrder[j];
 
@@ -920,6 +945,10 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
 
   unsigned ExpectedInstCount = UnrollFactor * TotalInsts;
   if (NewLoopInstCount != ExpectedInstCount) {
+    dbgs() << "ERROR: Instruction count mismatch after loop unrolling!\n";
+    dbgs() << "  Function: " << MF->getName() << "\n";
+    dbgs() << "  Pattern: " << BEInfo.Pattern << "\n";
+
     // Get debug location for the loop
     DebugLoc DL;
     for (MachineInstr &MI : *Header) {
@@ -929,22 +958,36 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
       }
     }
 
-    dbgs() << "ERROR: Instruction count mismatch after loop unrolling!\n";
-    dbgs() << "  Function: " << MF->getName() << "\n";
-    dbgs() << "  Pattern: " << Pattern << "\n";
     if (DL) {
       dbgs() << "  Source location: ";
-      if (DL.getLine() != 0) {
-        auto *Scope = cast<DIScope>(DL.getScope());
-        dbgs() << Scope->getFilename() << ":" << DL.getLine();
-        if (DL.getCol() != 0)
-          dbgs() << ":" << DL.getCol();
+      if (DL.getLine() != 0 && DL.getScope()) {
+        if (auto *Scope = dyn_cast<DIScope>(DL.getScope())) {
+          dbgs() << Scope->getFilename() << ":" << DL.getLine();
+          if (DL.getCol() != 0)
+            dbgs() << ":" << DL.getCol();
+        }
       }
       dbgs() << "\n";
     }
+
     dbgs() << "  Expected: " << ExpectedInstCount
            << " (UnrollFactor=" << UnrollFactor << " * TotalInsts=" << TotalInsts << ")\n";
     dbgs() << "  Actual: " << NewLoopInstCount << "\n";
+
+    // Debug: print instruction counts per block
+    dbgs() << "  Instruction counts per block:\n";
+    for (MachineBasicBlock *MBB : Loop->blocks()) {
+      unsigned BlockInstCount = 0;
+      dbgs() << "    Block " << MBB->getNumber() << ":\n";
+      for (MachineInstr &MI : *MBB) {
+        if (MI.isPHI() || MI.isDebugInstr())
+          continue;
+        dbgs() << "      " << MI;
+        ++BlockInstCount;
+      }
+      dbgs() << "      Total: " << BlockInstCount << " instructions\n";
+    }
+
     assert(false && "Instruction count mismatch after loop unrolling");
   }
 }
