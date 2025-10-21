@@ -655,6 +655,7 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
                                       TerminatorPattern Pattern) {
   assert (UnrollFactor > 1);
 
+  MachineLoopInfo &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
   MachineBasicBlock *Header = Loop->getHeader();
   MachineFunction *MF = Header->getParent();
   const TargetInstrInfo *TII = MF->getSubtarget().getInstrInfo();
@@ -707,13 +708,13 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   const bool failed = TII->analyzeBranch(*BackedgeBlock, TBB, FBB, Cond);
   assert(!failed && "should be able to analyze branch here");
 
+  unsigned TotalInsts = 0;
+  for (const auto &Entry : InstsToClone)
+    TotalInsts += Entry.second.size();
+  TotalInsts += 1; // for Backedge terminator
   LLVM_DEBUG({
-    unsigned TotalInsts = 0;
-    for (const auto &Entry : InstsToClone)
-      TotalInsts += Entry.second.size();
-    dbgs() << "  Original loop body has " << TotalInsts
-                    << "  instructions (without Backedge) spanning "
-                    << Loop->getNumBlocks() << " block(s).\n";
+    dbgs() << "  Original loop body has " << TotalInsts << "  instructions "
+              "spanning " << Loop->getNumBlocks() << " block(s).\n";
   });
 
   // We need to create new basic blocks for proper control flow
@@ -835,10 +836,10 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
           if (It != LoopBlocksInOrder.end()) {
             unsigned SuccIdx = std::distance(LoopBlocksInOrder.begin(), It);
             MachineBasicBlock *NewSucc = NewBlocks[0][SuccIdx];
-            LLVM_DEBUG(dbgs() << "  CFG:" <<
-              "\tOrigMBB name=" << OrigMBB->getSymbol()->getName() << " num=" << OrigMBB->getNumber() << "\n"
-              "\tOrigSucc name=" << OrigSucc->getSymbol()->getName() << " num=" << OrigSucc->getNumber() << "\n"
-              "\tNewSucc name=" << NewSucc->getSymbol()->getName() << " num=" << NewSucc->getNumber() << "\n"
+            if (0) LLVM_DEBUG(dbgs() << "  CFG:" <<
+              "\tOrigMBB name=" << OrigMBB->getSymbol()->getName() << " OrigMBB->isSuccessor(NewSucc)=" << OrigMBB->isSuccessor(NewSucc) << "\n"
+              "\tOrigSucc name=" << OrigSucc->getSymbol()->getName() << "\n"
+              "\tNewSucc name=" << NewSucc->getSymbol()->getName() << "\n"
             );
 
             // Remove old internal successor and add new one
@@ -898,7 +899,54 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
     }
   }
 
+  // Add all newly created blocks to the Loop
+  for (const auto &IterBlocks : NewBlocks) {
+    for (MachineBasicBlock *BB : IterBlocks) {
+      Loop->addBasicBlockToLoop(BB, MLI);
+    }
+  }
+
   LLVM_DEBUG(dbgs() << "  Duplicated loop body with unroll factor " << UnrollFactor << "\n");
+
+  // Verify instruction count matches expectations
+  unsigned NewLoopInstCount = 0;
+  for (MachineBasicBlock *MBB : Loop->blocks()) {
+    for (MachineInstr &MI : *MBB) {
+      if (MI.isPHI() || MI.isDebugInstr())
+        continue;
+      ++NewLoopInstCount;
+    }
+  }
+
+  unsigned ExpectedInstCount = UnrollFactor * TotalInsts;
+  if (NewLoopInstCount != ExpectedInstCount) {
+    // Get debug location for the loop
+    DebugLoc DL;
+    for (MachineInstr &MI : *Header) {
+      if (!MI.isDebugInstr() && MI.getDebugLoc()) {
+        DL = MI.getDebugLoc();
+        break;
+      }
+    }
+
+    dbgs() << "ERROR: Instruction count mismatch after loop unrolling!\n";
+    dbgs() << "  Function: " << MF->getName() << "\n";
+    dbgs() << "  Pattern: " << Pattern << "\n";
+    if (DL) {
+      dbgs() << "  Source location: ";
+      if (DL.getLine() != 0) {
+        auto *Scope = cast<DIScope>(DL.getScope());
+        dbgs() << Scope->getFilename() << ":" << DL.getLine();
+        if (DL.getCol() != 0)
+          dbgs() << ":" << DL.getCol();
+      }
+      dbgs() << "\n";
+    }
+    dbgs() << "  Expected: " << ExpectedInstCount
+           << " (UnrollFactor=" << UnrollFactor << " * TotalInsts=" << TotalInsts << ")\n";
+    dbgs() << "  Actual: " << NewLoopInstCount << "\n";
+    assert(false && "Instruction count mismatch after loop unrolling");
+  }
 }
 
 FunctionPass *llvm::createLoopUnrollASMPass() {
