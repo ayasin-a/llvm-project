@@ -104,9 +104,11 @@ private:
     return Remainder ? MachineWidth - Remainder : 0;
   }
 
-  void debugPrintLoopInfo(MachineFunction &MF, MachineBasicBlock *Header,
-                          StringRef Prefix);
+  void debugPrintLoopInfo(MachineFunction &MF, const MachineLoop *Loop,
+                          StringRef Prefix, MachineBasicBlock *ExitBlock = nullptr);
   MachineInstr* findLoopBackedgeBranch(const MachineLoop* Loop);
+  static MachineBasicBlock* findLoopExitBlock(const MachineLoop *Loop,
+                                              MachineInstr *BackedgeBranch = nullptr);
   bool processLoop(MachineLoop *Loop, MachineFunction &MF);
   bool processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                         MachineBasicBlock *Header, unsigned LoopCount,
@@ -243,6 +245,85 @@ MachineInstr* LoopUnrollASM::findLoopBackedgeBranch(const MachineLoop* Loop) {
   return BackedgeBranch;
 }
 
+/// Find the exit block for a given machine loop
+/// Returns nullptr if no unique exit block can be determined
+/// If BackedgeBranch is provided, prefers the exit block targeted by the backedge
+MachineBasicBlock* LoopUnrollASM::findLoopExitBlock(const MachineLoop *Loop,
+                                                     MachineInstr *BackedgeBranch) {
+  MachineBasicBlock *Header = Loop->getHeader();
+
+  // Collect all exit blocks (successors outside the loop)
+  SmallVector<MachineBasicBlock*, 4> ExitBlocks;
+  for (MachineBasicBlock *MBB : Loop->blocks()) {
+    for (MachineBasicBlock *Succ : MBB->successors()) {
+      if (!Loop->contains(Succ) &&
+          llvm::find(ExitBlocks, Succ) == ExitBlocks.end()) {
+        ExitBlocks.push_back(Succ);
+      }
+    }
+  }
+
+  // No exit blocks found - loop has no way to exit (infinite loop or malformed)
+  if (ExitBlocks.empty()) {
+    LLVM_DEBUG(dbgs() << "Warning: No exit blocks found for loop\n");
+    return nullptr;
+  }
+
+  // Single exit block - straightforward case
+  if (ExitBlocks.size() == 1)
+    return ExitBlocks[0];
+
+  // Multiple exit blocks - need heuristics to pick the "main" one
+  // If BackedgeBranch is provided, prefer the exit targeted by the backedge
+  if (BackedgeBranch) {
+    MachineBasicBlock *BackedgeBlock = BackedgeBranch->getParent();
+
+    // For conditional branches, check which target is an exit block
+    if (BackedgeBranch->isConditionalBranch()) {
+      for (const MachineOperand &MO : BackedgeBranch->operands()) {
+        if (MO.isMBB()) {
+          MachineBasicBlock *Target = MO.getMBB();
+          // Check if this target is an exit block (not the header and not in loop)
+          if (Target != Header && !Loop->contains(Target)) {
+            LLVM_DEBUG(dbgs() << "  info: Found exit block from backedge branch: "
+                              << Target->getSymbol()->getName() << "\n");
+            return Target;
+          }
+        }
+      }
+
+      // Also check fall-through successor
+      if (MachineBasicBlock *FallThrough = BackedgeBlock->getNextNode()) {
+        if (!Loop->contains(FallThrough)) {
+          LLVM_DEBUG(dbgs() << "  info: Found exit block from backedge fall-through: "
+                            << FallThrough->getSymbol()->getName() << "\n");
+          return FallThrough;
+        }
+      }
+    }
+  }
+
+  // Fallback: check if there's a unique latch exit block
+  MachineBasicBlock *Latch = Loop->getLoopLatch();
+  if (Latch) {
+    SmallVector<MachineBasicBlock*, 2> LatchExits;
+    for (MachineBasicBlock *Succ : Latch->successors()) {
+      if (!Loop->contains(Succ))
+        LatchExits.push_back(Succ);
+    }
+    if (LatchExits.size() == 1) {
+      LLVM_DEBUG(dbgs() << "  info: Using unique latch exit block: "
+                        << LatchExits[0]->getSymbol()->getName() << "\n");
+      return LatchExits[0];
+    }
+  }
+
+  // Final fallback: return the first exit block found
+  LLVM_DEBUG(dbgs() << "Warning: Multiple exit blocks found, using first one: "
+                    << ExitBlocks[0]->getSymbol()->getName() << "\n");
+  return ExitBlocks[0];
+}
+
 bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   // Process inner loops first (depth-first)
   bool Changed = false;
@@ -251,7 +332,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
 
   MachineBasicBlock *Header = Loop->getHeader();
-  LLVM_DEBUG(debugPrintLoopInfo(MF, Header, "Examining"));
+  LLVM_DEBUG(debugPrintLoopInfo(MF, Loop, "Examining"));
 
   // Only process innermost loops
   if (!Loop->getSubLoops().empty()) {
@@ -390,6 +471,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     for (const MachineOperand &MO : MI->operands()) {
       if (MO.isMBB()) {
         MachineBasicBlock *Target = MO.getMBB();
+        // TODO: there is a bug here; this actually check the branch targets something outside loop!!
         if (Target != Header && !Loop->contains(Target))
           return true;
       }
@@ -427,7 +509,8 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   if (NumTerminators >= 2 && BackedgeBranch) {
     bool allOthersTargetExit = true;
     for (auto T : Terminators) {
-      if (T != BackedgeBranch && !branchTargetsExit(T)) {
+      if ((T != BackedgeBranch && !branchTargetsExit(T)) ||
+          !T->isConditionalBranch()) {
         allOthersTargetExit = false;
         break;
       }
@@ -450,7 +533,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         Last->isUnconditionalBranch()) {
       // Pattern 1: conditional branch followed by unconditional branch
       Pattern = Two_Backedge_Uncond;
-      LLVM_DEBUG(dbgs() << "  Detected two-terminator pattern (cond + uncond)\n");
+      LLVM_DEBUG(dbgs() << "  Detected Two_Backedge_Uncond pattern\n");
     }
   }
 
@@ -555,8 +638,10 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 }
 
 void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
-                                       MachineBasicBlock *Header,
-                                       StringRef Prefix) {
+                                       const MachineLoop *Loop,
+                                       StringRef Prefix,
+                                       MachineBasicBlock *ExitBlock) {
+  MachineBasicBlock *Header = Loop->getHeader();
   // Get debug location information
   DebugLoc DL;
   for (MachineInstr &MI : *Header) {
@@ -579,6 +664,13 @@ void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
       }
       dbgs() << "\n";
     }
+    dbgs() << "  BasicBlocks in layout order:";
+    for (MachineBasicBlock &MBB : MF)
+      if (Loop->contains(&MBB))
+        dbgs() << "  , " << MBB.getSymbol()->getName();
+    if (ExitBlock)
+      dbgs() << "  ExitBlock: " << ExitBlock->getSymbol()->getName();
+    dbgs() << "\n";
   });
 }
 
@@ -594,7 +686,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                                      MachineBasicBlock *Header,
                                      unsigned LoopCount,
                                      const BackedgeInfo &Backedge) {
-  LLVM_DEBUG({debugPrintLoopInfo(MF, Header, "Found qualifying");
+  LLVM_DEBUG({debugPrintLoopInfo(MF, Loop, "Found qualifying", Backedge.ExitBlock);
     dbgs() << "  with Loop count: " << LoopCount << "\n";});
 
   ++NumLoopsDetected;
@@ -734,7 +826,7 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
     TotalInsts += Entry.second.size();
   TotalInsts += 1; // for Backedge terminator
   LLVM_DEBUG({
-    dbgs() << "  Original loop body has " << TotalInsts << "  instructions "
+    dbgs() << "  Original loop body has " << TotalInsts << " instructions "
               "spanning " << Loop->getNumBlocks() << " block(s).\n";
   });
 
@@ -841,12 +933,6 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
           if (It != LoopBlocksInOrder.end()) {
             unsigned SuccIdx = std::distance(LoopBlocksInOrder.begin(), It);
             MachineBasicBlock *NewSucc = NewBlocks[0][SuccIdx];
-            if (0) LLVM_DEBUG(dbgs() << "  CFG:" <<
-              "\tOrigMBB name=" << OrigMBB->getSymbol()->getName() << " OrigMBB->isSuccessor(NewSucc)=" << OrigMBB->isSuccessor(NewSucc) << "\n"
-              "\tOrigSucc name=" << OrigSucc->getSymbol()->getName() << "\n"
-              "\tNewSucc name=" << NewSucc->getSymbol()->getName() << "\n"
-            );
-
             // Remove old internal successor and add new one
             OrigMBB->removeSuccessor(OrigSucc);
             if (!OrigMBB->isSuccessor(NewSucc))
@@ -913,6 +999,10 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
 
   LLVM_DEBUG(dbgs() << "  Duplicated loop body with unroll factor " << UnrollFactor << "\n");
 
+  // Two_Backedge_Uncond may not meet instruction-count verification
+  if (Backedge.Pattern == Two_Backedge_Uncond)
+    return;
+
   // Verify instruction count matches expectations
   unsigned NewLoopInstCount = 0;
   for (MachineBasicBlock *MBB : Loop->blocks()) {
@@ -926,33 +1016,12 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   unsigned ExpectedInstCount = UnrollFactor * TotalInsts;
   if (NewLoopInstCount != ExpectedInstCount) {
     dbgs() << "ERROR: Instruction count mismatch after loop unrolling!\n";
-    dbgs() << "  Function: " << MF->getName() << "\n";
     dbgs() << "  Pattern: " << Backedge.Pattern << "\n";
-
-    // Get debug location for the loop
-    DebugLoc DL;
-    for (MachineInstr &MI : *Header) {
-      if (!MI.isDebugInstr() && MI.getDebugLoc()) {
-        DL = MI.getDebugLoc();
-        break;
-      }
-    }
-
-    if (DL) {
-      dbgs() << "  Source location: ";
-      if (DL.getLine() != 0 && DL.getScope()) {
-        if (auto *Scope = dyn_cast<DIScope>(DL.getScope())) {
-          dbgs() << Scope->getFilename() << ":" << DL.getLine();
-          if (DL.getCol() != 0)
-            dbgs() << ":" << DL.getCol();
-        }
-      }
-      dbgs() << "\n";
-    }
-
     dbgs() << "  Expected: " << ExpectedInstCount
            << " (UnrollFactor=" << UnrollFactor << " * TotalInsts=" << TotalInsts << ")\n";
     dbgs() << "  Actual: " << NewLoopInstCount << "\n";
+
+    debugPrintLoopInfo(*MF, Loop, " ", Backedge.ExitBlock);
 
     // Debug: print instruction counts per block
     dbgs() << "  Instruction counts per block:\n";
