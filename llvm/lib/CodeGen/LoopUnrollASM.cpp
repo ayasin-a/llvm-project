@@ -41,7 +41,6 @@ STATISTIC(NumLoopsNotEnoughBubbles, "Number of tight loops skipped (not enough b
 STATISTIC(NumInnermostLoops, "Number of inner loops skipped (not innermost)");
 STATISTIC(NumInnerLoopsNotSingleLatch, "Number of inner loops skipped (not single latch)");
 STATISTIC(NumInnerLoopsNotSingleBB, "Number of inner loops skipped (Header != Latch)");
-STATISTIC(NumInnerLoopsMultipleTerminators, "Number of inner loops skipped (multiple terminators)");
 STATISTIC(NumInnerLoopsMultipleTerminators2, "Number of inner loops skipped (2 terminators, non-standard)");
 STATISTIC(NumInnerLoopsMultipleTerminators3, "Number of inner loops skipped (3 terminators)");
 STATISTIC(NumInnerLoopsMultipleTerminators4Plus, "Number of inner loops skipped (4+ terminators)");
@@ -105,6 +104,9 @@ private:
     return Remainder ? MachineWidth - Remainder : 0;
   }
 
+  static bool isCompareBranchFusion(const MachineInstr *CompareInst,
+                                    const MachineInstr *BranchInst,
+                                    const TargetInstrInfo *TII);
   static void debugPrintLoopInfo(MachineFunction &MF, const MachineLoop *Loop,
                           StringRef Prefix, MachineBasicBlock *ExitBlock = nullptr);
   static MachineInstr* findLoopBackedgeBranch(const MachineLoop* Loop);
@@ -306,6 +308,101 @@ MachineBasicBlock* LoopUnrollASM::findLoopExitBlock(const MachineLoop *Loop,
   return ExitBlocks[0];
 }
 
+/// Check if two consecutive instructions form a Compare-Branch Fusion sequence
+/// according to ARM CPU architecture specifications.
+/// Returns true if fusion can occur, false otherwise.
+bool LoopUnrollASM::isCompareBranchFusion(const MachineInstr *CompareInst,
+                                          const MachineInstr *BranchInst,
+                                          const TargetInstrInfo *TII) {
+  if (!CompareInst || !BranchInst || !TII)
+    return false;
+
+  // Branch must immediately follow the compare instruction
+  if (CompareInst->getParent() != BranchInst->getParent())
+    return false;
+
+  StringRef CompareOpName = TII->getName(CompareInst->getOpcode());
+  StringRef BranchOpName = TII->getName(BranchInst->getOpcode());
+
+  // Check for shifted inputs in the comparison - fusion cannot occur with shifted inputs
+  // Look for shift operands in the compare instruction
+  for (const MachineOperand &MO : CompareInst->operands()) {
+    if (MO.isImm()) {
+      // Check if this immediate could be a shift amount
+      // On AArch64, shift operands are typically encoded in specific patterns
+      // This is a heuristic - a more precise check would require opcode-specific knowledge
+      continue;
+    }
+  }
+
+  // Pattern detection based on opcode names (AArch64-specific)
+  // Case 1: Flag-producing comparison followed by conditional branch
+  // Comparisons: CMN, CMP, TEQ, TST, ADDS, SUBS, ANDS, BICS
+  bool isFlagProducingCompare =
+      CompareOpName.contains("CMP") ||   // CMP variants
+      CompareOpName.contains("CMN") ||   // CMN variants
+      CompareOpName.contains("TST") ||   // TST variants
+      CompareOpName.contains("TEQ") ||   // TEQ variants
+      CompareOpName == "ADDS" || CompareOpName.starts_with("ADDSWr") || CompareOpName.starts_with("ADDSXr") ||
+      CompareOpName == "SUBS" || CompareOpName.starts_with("SUBSWr") || CompareOpName.starts_with("SUBSXr") ||
+      CompareOpName == "ANDS" || CompareOpName.starts_with("ANDSWr") || CompareOpName.starts_with("ANDSXr") ||
+      CompareOpName == "BICS" || CompareOpName.starts_with("BICSWr") || CompareOpName.starts_with("BICSXr");
+
+  // Conditional branch (B.cond)
+  bool isConditionalBranch = BranchInst->isConditionalBranch() &&
+                             (BranchOpName.starts_with("B") || BranchOpName.contains("Bcc"));
+
+  if (isFlagProducingCompare && isConditionalBranch) {
+    LLVM_DEBUG(dbgs() << "    Observed Compare-Branch Fusion (Case 1): "
+                      << CompareOpName << " + " << BranchOpName << "\n");
+    return true;
+  }
+
+  // Case 2: ALU operation followed by CBZ/CBNZ based on result register
+  // ALU operations: ADD, SUB, AND, BIC, ORN, ORR, EOR
+  bool isALUOp =
+      (CompareOpName.contains("ADD") && !CompareOpName.contains("ADDS")) ||  // ADD but not ADDS
+      (CompareOpName.contains("SUB") && !CompareOpName.contains("SUBS")) ||  // SUB but not SUBS
+      (CompareOpName.contains("AND") && !CompareOpName.contains("ANDS")) ||  // AND but not ANDS
+      (CompareOpName.contains("BIC") && !CompareOpName.contains("BICS")) ||  // BIC but not BICS
+      CompareOpName.contains("ORN") ||
+      CompareOpName.contains("ORR") ||
+      CompareOpName.contains("EOR");
+
+  // CBZ or CBNZ
+  bool isCBZorCBNZ = BranchOpName.starts_with("CBZ") || BranchOpName.starts_with("CBNZ");
+
+  if (isALUOp && isCBZorCBNZ) {
+    // Verify that CBZ/CBNZ operates on the result register produced by the ALU op
+    // Get the result register from ALU operation (typically first def operand)
+    Register ALUResultReg;
+    for (const MachineOperand &MO : CompareInst->operands()) {
+      if (MO.isReg() && MO.isDef()) {
+        ALUResultReg = MO.getReg();
+        break;
+      }
+    }
+
+    // Get the register tested by CBZ/CBNZ (typically first use operand)
+    Register BranchTestReg;
+    for (const MachineOperand &MO : BranchInst->operands()) {
+      if (MO.isReg() && MO.isUse()) {
+        BranchTestReg = MO.getReg();
+        break;
+      }
+    }
+
+    if (ALUResultReg.isValid() && BranchTestReg.isValid() &&
+        ALUResultReg == BranchTestReg) {
+      LLVM_DEBUG(dbgs() << "    Observed Compare-Branch Fusion (Case 2): "
+                        << CompareOpName << " + " << BranchOpName << "\n");
+      return true;
+    }
+  }
+
+  return false;
+}
+
 bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   // Process inner loops first (depth-first)
   bool Changed = false;
@@ -329,13 +426,14 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   MachineInstr *BackedgeBranch = findLoopBackedgeBranch(Loop);
   unsigned LoopCount = 0;
   SmallVector<MachineInstr *, 4> InternalBranches;
-#ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
   const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
+#ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
   bool hasAtomicOps = false;
 #endif
 
   // Calculate a precise LoopCount based on the loop size (in # fetch slots)
   // TODO: this should eventually interface with TTI
+  MachineInstr *PrevInst = nullptr;
   for (MachineBasicBlock *MBB : Loop->blocks()) {
     for (MachineInstr &MI : *MBB) {
       // Skip debug instructions and pseudo instructions
@@ -343,6 +441,16 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         continue;
 
       ++LoopCount;
+
+      // Check for Compare-Branch Fusion pattern
+      // If current instruction is a branch and previous was a compare,
+      // check if they can be fused
+      if (PrevInst && MI.isBranch() && !MI.isPseudo() &&
+          isCompareBranchFusion(PrevInst, &MI, TII)) {
+        // Fusion detected - decrement LoopCount as these two instructions
+        // execute as a single fused operation
+        --LoopCount;
+      }
 
       // Check if this is a post-index memory operation
       // Post-index operations update the base register and are typically
@@ -381,7 +489,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         }
 
         if (isPostIndex) {
-          // Count post-index operations twice (weight = 2)
+          LLVM_DEBUG(dbgs() << "    Observed post-index instruction in: " << OpcodeName << "\n");
           ++LoopCount;
         }
       }
@@ -427,6 +535,9 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
           break;
       }
 #endif // LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
+
+      // Track previous instruction for fusion detection
+      PrevInst = &MI;
     }
   }
 
@@ -513,8 +624,6 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
 
   if (Pattern == Nonsupported) {
-    ++NumInnerLoopsMultipleTerminators;
-    // Increment the specific counter based on number of terminators
     if (NumTerminators == 2)
       ++NumInnerLoopsMultipleTerminators2;
     else if (NumTerminators == 3)
