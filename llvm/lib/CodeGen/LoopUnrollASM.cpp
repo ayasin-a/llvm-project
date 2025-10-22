@@ -323,7 +323,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
   ++NumInnermostLoops;
 
-  MachineBasicBlock *Latch = Loop->getLoopLatch();
+  // this condition can be relaxed
   SmallVector<MachineBasicBlock *, 4> Latches;
   Loop->getLoopLatches(Latches);
   if (Latches.size() != 1) {
@@ -331,6 +331,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     LLVM_DEBUG(dbgs() << "  skipping: Not single latch\n");
     return Changed;
   }
+  MachineBasicBlock *Latch = Loop->getLoopLatch();
   assert(Latch == Latches[0]);
 
   // Count instructions in the loop and check for internal branches
@@ -448,16 +449,26 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
   MachineInstr *Last = &*LastIter;
 
-  // Lambda to check if a branch instruction targets an exit block
-  auto branchTargetsExit = [&](const MachineInstr *MI) -> bool {
-    for (const MachineOperand &MO : MI->operands()) {
-      if (MO.isMBB()) {
-        MachineBasicBlock *Target = MO.getMBB();
-        // TODO: a bug; this actually checks the branch targets something outside loop!!
-        if (Target != Header && !Loop->contains(Target))
-          return true;
+  // Find all exit blocks (successors that are outside the loop)
+  SmallVector<MachineBasicBlock*, 4> ExitBlocks;
+  for (MachineBasicBlock *MBB : Loop->blocks()) {
+    for (MachineBasicBlock *Succ : MBB->successors()) {
+      if (!Loop->contains(Succ) &&
+          std::find(ExitBlocks.begin(), ExitBlocks.end(), Succ) == ExitBlocks.end()) {
+        ExitBlocks.push_back(Succ);
       }
     }
+  }
+  assert(!ExitBlocks.empty() && ExitBlocks.size() >= 1 && "Could not find loop exit block");
+  MachineBasicBlock *ExitBlock = ExitBlocks[0];
+  MachineBasicBlock *FallThroughBlock = BackedgeBranch ? BackedgeBranch->getParent()->getNextNode() : nullptr;
+  assert(!BackedgeBranch || FallThroughBlock && "could not get FallThroughBlock!");
+  assert(!FallThroughBlock || !Loop->contains(FallThroughBlock) && "FallThroughBlock in Loop!");
+  // Lambda to check if a branch instruction targets THE exit block
+  auto branchTargetsExit = [&](const MachineInstr *MI) -> bool {
+    for (const MachineOperand &MO : MI->operands())
+      if (MO.isMBB() && MO.getMBB() == FallThroughBlock)
+        return true;
     return false;
   };
 
@@ -477,7 +488,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 
   // Check if this is a loop with multiple terminators where all non-backedge terminators target exit
   // Pattern: Multiple conditional exit branches + One backedge = Multi_CondExit_Backedge
-  if (0) LLVM_DEBUG({dbgs() << "  info: NumTerminators=" << NumTerminators
+  LLVM_DEBUG({dbgs() << "  info: NumTerminators=" << NumTerminators
                      << " Backedge=";
     if (BackedgeBranch)
       BackedgeBranch->print(dbgs());
@@ -505,7 +516,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
 
   // Check for backedge conditional followed by unconditional exit in the Latch block
-  // TODO: tweak the loop_with_cond_uncond_pattern to be detected here (avoid Branch Folding optimization)
+  // TODO: tweak the loop_with_cond_uncond_pattern test to be detected here (avoid Branch Folding optimization)
   MachineBasicBlock::iterator FirstTermIter = Latch->getFirstTerminator();
   if (FirstTermIter != LastIter) {
     auto SecondTermIter = std::next(FirstTermIter);
@@ -584,18 +595,6 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
 #endif
 
-  // Find all exit blocks (successors that are outside the loop)
-  SmallVector<MachineBasicBlock*, 4> ExitBlocks;
-  for (MachineBasicBlock *MBB : Loop->blocks()) {
-    for (MachineBasicBlock *Succ : MBB->successors()) {
-      if (!Loop->contains(Succ) &&
-          std::find(ExitBlocks.begin(), ExitBlocks.end(), Succ) == ExitBlocks.end()) {
-        ExitBlocks.push_back(Succ);
-      }
-    }
-  }
-  assert(!ExitBlocks.empty() && ExitBlocks.size() >= 1 && "Could not find loop exit block");
-  MachineBasicBlock *ExitBlock = ExitBlocks[0];
   // For correct instruction counting, verify that ExitBlock is the fallthrough of BackedgeBlock
   // This ensures we only insert one branch instruction (conditional) instead of two
   if (Pattern == Multi_CondExit_Backedge && !BackedgeBranch->getParent()->isLayoutSuccessor(ExitBlock)) {
