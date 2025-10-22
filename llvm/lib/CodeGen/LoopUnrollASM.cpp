@@ -462,7 +462,10 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   assert(!ExitBlocks.empty() && ExitBlocks.size() >= 1 && "Could not find loop exit block");
   MachineBasicBlock *ExitBlock = ExitBlocks[0];
   MachineBasicBlock *FallThroughBlock = BackedgeBranch ? BackedgeBranch->getParent()->getNextNode() : nullptr;
-  assert(!BackedgeBranch || FallThroughBlock && "could not get FallThroughBlock!");
+  if (BackedgeBranch && !FallThroughBlock) {
+    LLVM_DEBUG(dbgs() << "Warning: Invalid loop: could not get FallThroughBlock\n");
+    return Changed;
+  }
   if (FallThroughBlock && Loop->contains(FallThroughBlock)) {
     LLVM_DEBUG(dbgs() << "Warning: Invalid loop: Loop contains FallThroughBlock\n");
     return Changed;
