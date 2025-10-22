@@ -37,14 +37,15 @@ STATISTIC(NumLoopsDetected, "Number of tight loops detected by LoopUnrollASM");
 STATISTIC(NumLoopsUnrolled, "Number of tight loops unrolled by LoopUnrollASM");
 STATISTIC(NumLoopsUnrolledCondUncond, "Number of tight loops unrolled with cond+uncond terminators");
 STATISTIC(NumLoopsUnrolledMultiCondExit, "Number of tight loops unrolled with multi-cond-exit+backedge pattern");
-STATISTIC(NumLoopsFailedCondInversion, "Number of loops skipped due to branch inversion failure");
 STATISTIC(NumLoopsNotEnoughBubbles, "Number of tight loops skipped (not enough bubbles)");
+
+STATISTIC(NumInnermostLoops, "Number of inner loops skipped (not innermost)");
+STATISTIC(NumLoopsFailedCondInversion, "Number of loops skipped due to branch inversion failure");
 STATISTIC(NumInnerLoopsNotSingleLatch, "Number of inner loops skipped (not single latch)");
 STATISTIC(NumInnerLoopsMultipleTerminators, "Number of inner loops skipped (multiple terminators)");
 STATISTIC(NumInnerLoopsMultipleTerminators2, "Number of inner loops skipped (2 terminators, non-standard)");
 STATISTIC(NumInnerLoopsMultipleTerminators3, "Number of inner loops skipped (3 terminators)");
 STATISTIC(NumInnerLoopsMultipleTerminators4Plus, "Number of inner loops skipped (4+ terminators)");
-STATISTIC(NumInnermostLoops, "Number of inner loops skipped (not innermost)");
 STATISTIC(NumInnerLoopsInvalidTerminator, "Number of inner loops skipped (invalid terminator instruction)");
 STATISTIC(NumInnerLoopsBranchUnconditional, "Number of inner loops skipped (unconditional branch)");
 STATISTIC(NumInnerLoopsBranchUnconditionalWithSingleCondInternal, "Number of inner loops skipped (unconditional branch with single conditional internal)");
@@ -56,6 +57,7 @@ STATISTIC(NumInnerLoopsHasInternalBranch, "Number of inner loops skipped (has in
 STATISTIC(NumInnerLoopsTooManyInsts, "Number of inner loops skipped (too many instructions)");
 STATISTIC(NumInnerLoopsExitNotFallthru, "Number of inner loops skipped (ExitBlock isn't fallthrough of BackedgeBlock)");
 STATISTIC(NumInnerLoopsCannotAnalyzeBranch, "Number of tight loops skipped (cannot analyze branch)");
+STATISTIC(NumInnerLoops_BackedgeFallthruHeader, "Number of inner loops where Backedge branch fallsthrough into Loop Header");
 
 static cl::opt<unsigned> LoopUnrollASMMaxInsts(
     "loop-unroll-asm-max-insts",
@@ -104,9 +106,9 @@ private:
     return Remainder ? MachineWidth - Remainder : 0;
   }
 
-  void debugPrintLoopInfo(MachineFunction &MF, const MachineLoop *Loop,
+  static void debugPrintLoopInfo(MachineFunction &MF, const MachineLoop *Loop,
                           StringRef Prefix, MachineBasicBlock *ExitBlock = nullptr);
-  MachineInstr* findLoopBackedgeBranch(const MachineLoop* Loop);
+  static MachineInstr* findLoopBackedgeBranch(const MachineLoop* Loop);
   static MachineBasicBlock* findLoopExitBlock(const MachineLoop *Loop,
                                               MachineInstr *BackedgeBranch = nullptr);
   bool processLoop(MachineLoop *Loop, MachineFunction &MF);
@@ -147,9 +149,7 @@ bool LoopUnrollASM::runOnMachineFunction(MachineFunction &MF) {
 /// Find the backedge branch instruction for a given machine loop
 /// Returns nullptr if no backedge branch is found or if the loop structure is invalid
 MachineInstr* LoopUnrollASM::findLoopBackedgeBranch(const MachineLoop* Loop) {
-  assert(Loop);
   MachineBasicBlock* Header = Loop->getHeader();
-  assert(Header);
 
   // Find all backedge blocks (blocks in the loop that branch back to header)
   SmallVector<MachineBasicBlock*, 4> BackedgeBlocks;
@@ -187,9 +187,8 @@ MachineInstr* LoopUnrollASM::findLoopBackedgeBranch(const MachineLoop* Loop) {
                         << MainBackedgeBlock->getNumber() << "\n");
     }
   }
-  if (!MainBackedgeBlock) {
+  if (!MainBackedgeBlock)
     return nullptr;
-  }
 
   // Find the terminating branch instruction in the backedge block
   MachineInstr* BackedgeBranch = nullptr;
@@ -202,30 +201,18 @@ MachineInstr* LoopUnrollASM::findLoopBackedgeBranch(const MachineLoop* Loop) {
 
     // Verify this branch actually targets the loop header
     bool BranchesToHeader = false;
-
-    if (MI.isUnconditionalBranch()) {
-      // For unconditional branches, check if it targets the header
+    if (MI.isConditionalBranch() || MI.isUnconditionalBranch()) {
       for (const MachineOperand& MO : MI.operands()) {
         if (MO.isMBB() && MO.getMBB() == Header) {
           BranchesToHeader = true;
           break;
         }
       }
-    } else if (MI.isConditionalBranch()) {
-      // For conditional branches, check if one of the targets is the header
-      for (const MachineOperand& MO : MI.operands()) {
-        if (MO.isMBB() && MO.getMBB() == Header) {
-          BranchesToHeader = true;
-          break;
-        }
-      }
-
-      // Also check fall-through case
-      if (!BranchesToHeader) {
-        MachineBasicBlock* FallThrough = MainBackedgeBlock->getNextNode();
-        if (FallThrough == Header) {
-          BranchesToHeader = true;
-        }
+      // Also check fall-through case for conditional branches
+      if (!BranchesToHeader && MI.isConditionalBranch() &&
+          (MainBackedgeBlock->getNextNode() == Header)) {
+        BranchesToHeader = true;
+        ++NumInnerLoops_BackedgeFallthruHeader;
       }
     }
 
@@ -235,12 +222,7 @@ MachineInstr* LoopUnrollASM::findLoopBackedgeBranch(const MachineLoop* Loop) {
     }
   }
 
-  if (!BackedgeBranch) {
-    LLVM_DEBUG(dbgs() << "Warning: No branch instruction found that targets loop header\n");
-    return nullptr;
-  }
-
-  LLVM_DEBUG(dbgs() << "  info: main backedge branch: " << *BackedgeBranch);
+  LLVM_DEBUG(if (!BackedgeBranch) dbgs() << "Warning: No branch found that targets loop header\n");
 
   return BackedgeBranch;
 }
@@ -571,6 +553,11 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     if (InternalBranches.size() == 1 && InternalBranches[0]->isConditionalBranch())
       ++NumInnerLoopsBranchUnconditionalWithSingleCondInternal;
     LLVM_DEBUG(dbgs() << "  skipping: Unconditional branch\n");
+    // TODO: we should be able to unroll simple cases like:
+    // Loop:  inst1
+    //        b.eq Exit
+    //        b Loop
+    //  Exit:
     return Changed;
   }
 
