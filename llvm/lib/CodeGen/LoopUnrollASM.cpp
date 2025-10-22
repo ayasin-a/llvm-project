@@ -46,7 +46,7 @@ STATISTIC(NumInnerLoopsMultipleTerminators, "Number of inner loops skipped (mult
 STATISTIC(NumInnerLoopsMultipleTerminators2, "Number of inner loops skipped (2 terminators, non-standard)");
 STATISTIC(NumInnerLoopsMultipleTerminators3, "Number of inner loops skipped (3 terminators)");
 STATISTIC(NumInnerLoopsMultipleTerminators4Plus, "Number of inner loops skipped (4+ terminators)");
-STATISTIC(NumInnerLoopsInvalidTerminator, "Number of inner loops skipped (invalid terminator instruction)");
+STATISTIC(NumInnerLoopsInvalid, "Number of inner loops skipped (invalid)");
 STATISTIC(NumInnerLoopsBranchUnconditional, "Number of inner loops skipped (unconditional branch)");
 STATISTIC(NumInnerLoopsBranchUnconditionalWithSingleCondInternal, "Number of inner loops skipped (unconditional branch with single conditional internal)");
 STATISTIC(NumInnerLoopsBranchIndirect, "Number of inner loops skipped (indirect branch)");
@@ -443,9 +443,9 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 
   MachineBasicBlock::iterator LastIter = Latch->getLastNonDebugInstr();
   if (LastIter == Latch->end()) {
-    ++NumInnerLoopsInvalidTerminator;
-    LLVM_DEBUG(dbgs() << "  skipping: No non-debug instructions\n");
-    return Changed; // No non-debug instructions
+    ++NumInnerLoopsInvalid;
+    LLVM_DEBUG(dbgs() << "  skipping: Invalid loop: No non-debug instructions\n");
+    return Changed;
   }
   MachineInstr *Last = &*LastIter;
 
@@ -463,7 +463,10 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   MachineBasicBlock *ExitBlock = ExitBlocks[0];
   MachineBasicBlock *FallThroughBlock = BackedgeBranch ? BackedgeBranch->getParent()->getNextNode() : nullptr;
   assert(!BackedgeBranch || FallThroughBlock && "could not get FallThroughBlock!");
-  assert(!FallThroughBlock || !Loop->contains(FallThroughBlock) && "FallThroughBlock in Loop!");
+  if (FallThroughBlock && Loop->contains(FallThroughBlock)) {
+    LLVM_DEBUG(dbgs() << "Warning: Invalid loop: Loop contains FallThroughBlock\n");
+    return Changed;
+  }
   // Lambda to check if a branch instruction targets THE exit block
   auto branchTargetsExit = [&](const MachineInstr *MI) -> bool {
     for (const MachineOperand &MO : MI->operands())
@@ -552,8 +555,8 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   // Check if the last instruction is actually a branch
   // In some cases (e.g., when there are no terminators), Last may not be a branch
   if (!Last->isBranch()) {
-    ++NumInnerLoopsInvalidTerminator;
-    LLVM_DEBUG(dbgs() << "  skipping: Last instruction is not a branch\n");
+    ++NumInnerLoopsInvalid;
+    LLVM_DEBUG(dbgs() << "  skipping: Invalid loop: Last instruction is not a branch\n");
     return Changed;
   }
 
