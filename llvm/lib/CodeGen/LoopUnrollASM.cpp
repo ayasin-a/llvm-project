@@ -38,10 +38,9 @@ STATISTIC(NumLoopsUnrolled, "Number of tight loops unrolled by LoopUnrollASM");
 STATISTIC(NumLoopsUnrolledCondUncond, "Number of tight loops unrolled with cond+uncond terminators");
 STATISTIC(NumLoopsUnrolledMultiCondExit, "Number of tight loops unrolled with multi-cond-exit+backedge pattern");
 STATISTIC(NumLoopsNotEnoughBubbles, "Number of tight loops skipped (not enough bubbles)");
-
 STATISTIC(NumInnermostLoops, "Number of inner loops skipped (not innermost)");
-STATISTIC(NumLoopsFailedCondInversion, "Number of loops skipped due to branch inversion failure");
 STATISTIC(NumInnerLoopsNotSingleLatch, "Number of inner loops skipped (not single latch)");
+STATISTIC(NumInnerLoopsNotSingleBB, "Number of inner loops skipped (Header != Latch)");
 STATISTIC(NumInnerLoopsMultipleTerminators, "Number of inner loops skipped (multiple terminators)");
 STATISTIC(NumInnerLoopsMultipleTerminators2, "Number of inner loops skipped (2 terminators, non-standard)");
 STATISTIC(NumInnerLoopsMultipleTerminators3, "Number of inner loops skipped (3 terminators)");
@@ -51,12 +50,12 @@ STATISTIC(NumInnerLoopsBranchUnconditional, "Number of inner loops skipped (unco
 STATISTIC(NumInnerLoopsBranchUnconditionalWithSingleCondInternal, "Number of inner loops skipped (unconditional branch with single conditional internal)");
 STATISTIC(NumInnerLoopsBranchIndirect, "Number of inner loops skipped (indirect branch)");
 STATISTIC(NumInnerLoopsBranchConditionalNoBackedge, "Number of inner loops skipped (conditional branch without backedge)");
-STATISTIC(NumInnerLoopsNotSingleBB, "Number of inner loops skipped (Header != Latch)");
 STATISTIC(NumInnerLoopsHasAtomicOps, "Number of inner loops skipped (has atomic ops)");
 STATISTIC(NumInnerLoopsHasInternalBranch, "Number of inner loops skipped (has internal branch)");
 STATISTIC(NumInnerLoopsTooManyInsts, "Number of inner loops skipped (too many instructions)");
 STATISTIC(NumInnerLoopsExitNotFallthru, "Number of inner loops skipped (ExitBlock isn't fallthrough of BackedgeBlock)");
 STATISTIC(NumInnerLoopsCannotAnalyzeBranch, "Number of tight loops skipped (cannot analyze branch)");
+STATISTIC(NumInnerLoopsFailedCondInversion, "Number of loops skipped due to branch inversion failure");
 STATISTIC(NumInnerLoops_BackedgeFallthruHeader, "Number of inner loops where Backedge branch fallsthrough into Loop Header");
 
 static cl::opt<unsigned> LoopUnrollASMMaxInsts(
@@ -212,6 +211,7 @@ MachineInstr* LoopUnrollASM::findLoopBackedgeBranch(const MachineLoop* Loop) {
       if (!BranchesToHeader && MI.isConditionalBranch() &&
           (MainBackedgeBlock->getNextNode() == Header)) {
         BranchesToHeader = true;
+        LLVM_DEBUG(dbgs() << "  backedge falls-through loop header\n");
         ++NumInnerLoops_BackedgeFallthruHeader;
       }
     }
@@ -313,17 +313,16 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     Changed |= processLoop(SubLoop, MF);
   }
 
-  MachineBasicBlock *Header = Loop->getHeader();
-  LLVM_DEBUG(debugPrintLoopInfo(MF, Loop, "Examining"));
-
   // Only process innermost loops
   if (!Loop->getSubLoops().empty()) {
-    LLVM_DEBUG(dbgs() << "  skipping: Not innermost\n");
+    LLVM_DEBUG(dbgs() << "skipping some non-innermost\n");
     return Changed;
   }
   ++NumInnermostLoops;
+  MachineBasicBlock *Header = Loop->getHeader();
+  LLVM_DEBUG(debugPrintLoopInfo(MF, Loop, "Examining"));
 
-  // this condition can be relaxed
+  // TODO: this condition can be relaxed
   SmallVector<MachineBasicBlock *, 4> Latches;
   Loop->getLoopLatches(Latches);
   if (Latches.size() != 1) {
@@ -459,21 +458,17 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       }
     }
   }
-  assert(!ExitBlocks.empty() && ExitBlocks.size() >= 1 && "Could not find loop exit block");
+  if (ExitBlocks.empty()) {
+    ++NumInnerLoopsInvalid;
+    LLVM_DEBUG(dbgs() << "  skipping: Invalid loop: no exit blocks\n");
+    return Changed;
+  }
   MachineBasicBlock *ExitBlock = ExitBlocks[0];
-  MachineBasicBlock *FallThroughBlock = BackedgeBranch ? BackedgeBranch->getParent()->getNextNode() : nullptr;
-  if (BackedgeBranch && !FallThroughBlock) {
-    LLVM_DEBUG(dbgs() << "Warning: Invalid loop: could not get FallThroughBlock\n");
-    return Changed;
-  }
-  if (FallThroughBlock && Loop->contains(FallThroughBlock)) {
-    LLVM_DEBUG(dbgs() << "Warning: Invalid loop: Loop contains FallThroughBlock\n");
-    return Changed;
-  }
+
   // Lambda to check if a branch instruction targets THE exit block
   auto branchTargetsExit = [&](const MachineInstr *MI) -> bool {
     for (const MachineOperand &MO : MI->operands())
-      if (MO.isMBB() && MO.getMBB() == FallThroughBlock)
+      if (MO.isMBB() && MO.getMBB() == ExitBlock)
         return true;
     return false;
   };
@@ -494,14 +489,11 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 
   // Check if this is a loop with multiple terminators where all non-backedge terminators target exit
   // Pattern: Multiple conditional exit branches + One backedge = Multi_CondExit_Backedge
-  LLVM_DEBUG({dbgs() << "  info: NumTerminators=" << NumTerminators
-                     << " Backedge=";
-    if (BackedgeBranch)
-      BackedgeBranch->print(dbgs());
-    else
-      dbgs() << "none\n";
+  LLVM_DEBUG({dbgs() << "  info: NumTerminators=" << NumTerminators << "\n";
     for (auto T: Terminators)
-      dbgs() << "    info: Cond=" << T->isConditionalBranch() << " branchTargetsExit=" << branchTargetsExit(T) << "\n";
+      dbgs() << "    info: cond=" << T->isConditionalBranch() <<
+                " branchTargetsExit=" << branchTargetsExit(T) <<
+                " backedge=" << (T == BackedgeBranch) << "\n";
   });
 
   // Check if all terminators except BackedgeBranch target the exit
@@ -656,10 +648,10 @@ void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
       }
       dbgs() << "\n";
     }
-    dbgs() << "  BasicBlocks in layout order:";
+    dbgs() << "  Header=" << Header->getSymbol()->getName() << ", BasicBlocks in layout order: ";
     for (MachineBasicBlock &MBB : MF)
       if (Loop->contains(&MBB))
-        dbgs() << "  , " << MBB.getSymbol()->getName();
+        dbgs() << MBB.getSymbol()->getName() << " , ";
     if (ExitBlock)
       dbgs() << "  ExitBlock: " << ExitBlock->getSymbol()->getName();
     dbgs() << "\n";
@@ -708,7 +700,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     SmallVector<MachineOperand, 4> InvertedCond(Cond);
     if (TII->reverseBranchCondition(InvertedCond)) {
       LLVM_DEBUG(dbgs() << "  Unable to invert branch condition, skipping unrolling\n");
-      ++NumLoopsFailedCondInversion;
+      ++NumInnerLoopsFailedCondInversion;
       return false;
     }
 
