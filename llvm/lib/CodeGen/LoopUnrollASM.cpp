@@ -448,27 +448,10 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
   MachineInstr *Last = &*LastIter;
 
-  // Find all exit blocks (successors that are outside the loop)
-  SmallVector<MachineBasicBlock*, 4> ExitBlocks;
-  for (MachineBasicBlock *MBB : Loop->blocks()) {
-    for (MachineBasicBlock *Succ : MBB->successors()) {
-      if (!Loop->contains(Succ) &&
-          std::find(ExitBlocks.begin(), ExitBlocks.end(), Succ) == ExitBlocks.end()) {
-        ExitBlocks.push_back(Succ);
-      }
-    }
-  }
-  if (ExitBlocks.empty()) {
-    ++NumInnerLoopsInvalid;
-    LLVM_DEBUG(dbgs() << "  skipping: Invalid loop: no exit blocks\n");
-    return Changed;
-  }
-  MachineBasicBlock *ExitBlock = ExitBlocks[0];
-
-  // Lambda to check if a branch instruction targets THE exit block
+  // Lambda to check if a branch instruction targets any block outside the loop
   auto branchTargetsExit = [&](const MachineInstr *MI) -> bool {
     for (const MachineOperand &MO : MI->operands())
-      if (MO.isMBB() && MO.getMBB() == ExitBlock)
+      if (MO.isMBB() && !Loop->contains(MO.getMBB()))
         return true;
     return false;
   };
@@ -593,6 +576,22 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
 #endif
 
+  // Find all exit blocks (successors that are outside the loop)
+  SmallVector<MachineBasicBlock*, 4> ExitBlocks;
+  for (MachineBasicBlock *MBB : Loop->blocks()) {
+    for (MachineBasicBlock *Succ : MBB->successors()) {
+      if (!Loop->contains(Succ) &&
+          std::find(ExitBlocks.begin(), ExitBlocks.end(), Succ) == ExitBlocks.end()) {
+        ExitBlocks.push_back(Succ);
+      }
+    }
+  }
+  if (ExitBlocks.empty()) {
+    ++NumInnerLoopsInvalid;
+    LLVM_DEBUG(dbgs() << "  skipping: Invalid loop: no exit blocks\n");
+    return Changed;
+  }
+  MachineBasicBlock *ExitBlock = ExitBlocks[0];
   // For correct instruction counting, verify that ExitBlock is the fallthrough of BackedgeBlock
   // This ensures we only insert one branch instruction (conditional) instead of two
   if (Pattern == Multi_CondExit_Backedge && !BackedgeBranch->getParent()->isLayoutSuccessor(ExitBlock)) {
