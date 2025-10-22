@@ -313,25 +313,15 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     Changed |= processLoop(SubLoop, MF);
   }
 
+  MachineBasicBlock *Header = Loop->getHeader();
+  LLVM_DEBUG(debugPrintLoopInfo(MF, Loop, "Examining"));
   // Only process innermost loops
   if (!Loop->getSubLoops().empty()) {
-    LLVM_DEBUG(dbgs() << "skipping some non-innermost\n");
+    //LLVM_DEBUG(dbgs() << "skipping some non-innermost\n");
+    LLVM_DEBUG(dbgs() << "  skipping non-innermost\n");
     return Changed;
   }
   ++NumInnermostLoops;
-  MachineBasicBlock *Header = Loop->getHeader();
-  LLVM_DEBUG(debugPrintLoopInfo(MF, Loop, "Examining"));
-
-  // TODO: this condition can be relaxed
-  SmallVector<MachineBasicBlock *, 4> Latches;
-  Loop->getLoopLatches(Latches);
-  if (Latches.size() != 1) {
-    ++NumInnerLoopsNotSingleLatch;
-    LLVM_DEBUG(dbgs() << "  skipping: Not single latch\n");
-    return Changed;
-  }
-  MachineBasicBlock *Latch = Loop->getLoopLatch();
-  assert(Latch == Latches[0]);
 
   // Count instructions in the loop and check for internal branches
   // We want to skip loops that have branches within the loop body
@@ -440,14 +430,6 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     }
   }
 
-  MachineBasicBlock::iterator LastIter = Latch->getLastNonDebugInstr();
-  if (LastIter == Latch->end()) {
-    ++NumInnerLoopsInvalid;
-    LLVM_DEBUG(dbgs() << "  skipping: Invalid loop: No non-debug instructions\n");
-    return Changed;
-  }
-  MachineInstr *Last = &*LastIter;
-
   // Lambda to check if a branch instruction targets any block outside the loop
   auto branchTargetsExit = [&](const MachineInstr *MI) -> bool {
     for (const MachineOperand &MO : MI->operands())
@@ -480,7 +462,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   });
 
   // Check if all terminators except BackedgeBranch target the exit
-  if (NumTerminators >= 2 && BackedgeBranch) {
+  if (NumTerminators > 1 && BackedgeBranch) {
     bool allOthersTargetExit = true;
     for (auto T : Terminators) {
       if ((T != BackedgeBranch && !branchTargetsExit(T)) ||
@@ -496,18 +478,37 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     }
   }
 
-  // Check for backedge conditional followed by unconditional exit in the Latch block
-  // TODO: tweak the loop_with_cond_uncond_pattern test to be detected here (avoid Branch Folding optimization)
-  MachineBasicBlock::iterator FirstTermIter = Latch->getFirstTerminator();
-  if (FirstTermIter != LastIter) {
-    auto SecondTermIter = std::next(FirstTermIter);
-    if (SecondTermIter == LastIter &&
-        FirstTermIter != Latch->end() &&
-        FirstTermIter->isConditionalBranch() &&
-        Last->isUnconditionalBranch()) {
-      // Pattern 1: conditional branch followed by unconditional branch
-      Pattern = Two_Backedge_Uncond;
-      LLVM_DEBUG(dbgs() << "  Detected Two_Backedge_Uncond pattern\n");
+  MachineBasicBlock *Latch = Loop->getLoopLatch();
+  if (Pattern == Nonsupported && Latch) {
+    MachineBasicBlock::iterator LastIter = Latch->getLastNonDebugInstr();
+    if (LastIter == Latch->end()) {
+      ++NumInnerLoopsInvalid;
+      LLVM_DEBUG(dbgs() << "  skipping: Invalid loop: No non-debug instructions\n");
+      return Changed;
+    }
+
+    // Check for backedge conditional followed by unconditional exit in the Latch block
+    // TODO: tweak the loop_with_cond_uncond_pattern test to be detected here (avoid Branch Folding optimization)
+    MachineInstr *Last = &*LastIter;
+    MachineBasicBlock::iterator FirstTermIter = Latch->getFirstTerminator();
+    if (FirstTermIter != LastIter) {
+      auto SecondTermIter = std::next(FirstTermIter);
+      if (SecondTermIter == LastIter &&
+          FirstTermIter != Latch->end() &&
+          FirstTermIter->isConditionalBranch() &&
+          Last->isUnconditionalBranch()) {
+        // Pattern 1: conditional branch followed by unconditional branch
+        Pattern = Two_Backedge_Uncond;
+        LLVM_DEBUG(dbgs() << "  Detected Two_Backedge_Uncond pattern\n");
+      }
+    }
+
+    // Check if the last instruction is actually a branch
+    // In some cases (e.g., when there are no terminators), Last may not be a branch
+    if (Pattern == Nonsupported && !Last->isBranch()) {
+      ++NumInnerLoopsInvalid;
+      LLVM_DEBUG(dbgs() << "  skipping: Invalid loop: Last instruction is not a branch\n");
+      return Changed;
     }
   }
 
@@ -530,11 +531,11 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     return Changed;
   }
 
-  // Check if the last instruction is actually a branch
-  // In some cases (e.g., when there are no terminators), Last may not be a branch
-  if (!Last->isBranch()) {
-    ++NumInnerLoopsInvalid;
-    LLVM_DEBUG(dbgs() << "  skipping: Invalid loop: Last instruction is not a branch\n");
+  SmallVector<MachineBasicBlock *, 4> Latches;
+  Loop->getLoopLatches(Latches);
+  if (Latches.size() != 1) {
+    ++NumInnerLoopsNotSingleLatch;
+    LLVM_DEBUG(dbgs() << "  skipping: Not single latch\n");
     return Changed;
   }
 
@@ -553,7 +554,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     return Changed;
   }
 
-  if (Last->isIndirectBranch()) {
+  if (BackedgeBranch->isIndirectBranch()) {
     ++NumInnerLoopsBranchIndirect;
     LLVM_DEBUG(dbgs() << "  skipping: Indirect branch\n");
     return Changed;
