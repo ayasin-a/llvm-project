@@ -74,9 +74,14 @@ struct BackedgeInfo {
   MachineInstr *Branch;
   TerminatorPattern Pattern;
   MachineBasicBlock *ExitBlock;
+  SmallVector<MachineOperand, 4> Cond;
+  SmallVector<MachineOperand, 4> InvertedCond;
 
-  BackedgeInfo(MachineInstr *Branch, TerminatorPattern Pattern, MachineBasicBlock *ExitBlock)
-    : Branch(Branch), Pattern(Pattern), ExitBlock(ExitBlock) {}
+  BackedgeInfo(MachineInstr *Branch, TerminatorPattern Pattern, MachineBasicBlock *ExitBlock,
+               const SmallVectorImpl<MachineOperand> &Cond,
+               const SmallVectorImpl<MachineOperand> &InvertedCond)
+    : Branch(Branch), Pattern(Pattern), ExitBlock(ExitBlock), Cond(Cond.begin(), Cond.end()),
+      InvertedCond(InvertedCond.begin(), InvertedCond.end()) {}
 };
 
 class LoopUnrollASM : public MachineFunctionPass {
@@ -110,16 +115,13 @@ private:
   static void debugPrintLoopInfo(MachineFunction &MF, const MachineLoop *Loop,
                           StringRef Prefix, MachineBasicBlock *ExitBlock = nullptr);
   static MachineInstr* findLoopBackedgeBranch(const MachineLoop* Loop);
-  static MachineBasicBlock* findLoopExitBlock(const MachineLoop *Loop,
-                                              MachineInstr *BackedgeBranch = nullptr);
   bool processLoop(MachineLoop *Loop, MachineFunction &MF);
   bool processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                         MachineBasicBlock *Header, unsigned LoopCount,
-                        const BackedgeInfo &Backedge);
+                        BackedgeInfo &Backedge);
   unsigned findBestUnrollCount(unsigned LoopCount, unsigned Bubbles,
                                unsigned MachineWidth);
   void duplicateLoopBody(MachineLoop *Loop, unsigned UnrollFactor,
-                         const SmallVectorImpl<MachineOperand> &InvertedCond,
                          const BackedgeInfo &Backedge);
 };
 } // end anonymous namespace
@@ -227,85 +229,6 @@ MachineInstr* LoopUnrollASM::findLoopBackedgeBranch(const MachineLoop* Loop) {
   LLVM_DEBUG(if (!BackedgeBranch) dbgs() << "Warning: No branch found that targets loop header\n");
 
   return BackedgeBranch;
-}
-
-/// Find the exit block for a given machine loop
-/// Returns nullptr if no unique exit block can be determined
-/// If BackedgeBranch is provided, prefers the exit block targeted by the backedge
-MachineBasicBlock* LoopUnrollASM::findLoopExitBlock(const MachineLoop *Loop,
-                                                     MachineInstr *BackedgeBranch) {
-  MachineBasicBlock *Header = Loop->getHeader();
-
-  // Collect all exit blocks (successors outside the loop)
-  SmallVector<MachineBasicBlock*, 4> ExitBlocks;
-  for (MachineBasicBlock *MBB : Loop->blocks()) {
-    for (MachineBasicBlock *Succ : MBB->successors()) {
-      if (!Loop->contains(Succ) &&
-          llvm::find(ExitBlocks, Succ) == ExitBlocks.end()) {
-        ExitBlocks.push_back(Succ);
-      }
-    }
-  }
-
-  // No exit blocks found - loop has no way to exit (infinite loop or malformed)
-  if (ExitBlocks.empty()) {
-    LLVM_DEBUG(dbgs() << "Warning: No exit blocks found for loop\n");
-    return nullptr;
-  }
-
-  // Single exit block - straightforward case
-  if (ExitBlocks.size() == 1)
-    return ExitBlocks[0];
-
-  // Multiple exit blocks - need heuristics to pick the "main" one
-  // If BackedgeBranch is provided, prefer the exit targeted by the backedge
-  if (BackedgeBranch) {
-    MachineBasicBlock *BackedgeBlock = BackedgeBranch->getParent();
-
-    // For conditional branches, check which target is an exit block
-    if (BackedgeBranch->isConditionalBranch()) {
-      for (const MachineOperand &MO : BackedgeBranch->operands()) {
-        if (MO.isMBB()) {
-          MachineBasicBlock *Target = MO.getMBB();
-          // Check if this target is an exit block (not the header and not in loop)
-          if (Target != Header && !Loop->contains(Target)) {
-            LLVM_DEBUG(dbgs() << "  info: Found exit block from backedge branch: "
-                              << Target->getSymbol()->getName() << "\n");
-            return Target;
-          }
-        }
-      }
-
-      // Also check fall-through successor
-      if (MachineBasicBlock *FallThrough = BackedgeBlock->getNextNode()) {
-        if (!Loop->contains(FallThrough)) {
-          LLVM_DEBUG(dbgs() << "  info: Found exit block from backedge fall-through: "
-                            << FallThrough->getSymbol()->getName() << "\n");
-          return FallThrough;
-        }
-      }
-    }
-  }
-
-  // Fallback: check if there's a unique latch exit block
-  MachineBasicBlock *Latch = Loop->getLoopLatch();
-  if (Latch) {
-    SmallVector<MachineBasicBlock*, 2> LatchExits;
-    for (MachineBasicBlock *Succ : Latch->successors()) {
-      if (!Loop->contains(Succ))
-        LatchExits.push_back(Succ);
-    }
-    if (LatchExits.size() == 1) {
-      LLVM_DEBUG(dbgs() << "  info: Using unique latch exit block: "
-                        << LatchExits[0]->getSymbol()->getName() << "\n");
-      return LatchExits[0];
-    }
-  }
-
-  // Final fallback: return the first exit block found
-  LLVM_DEBUG(dbgs() << "Warning: Multiple exit blocks found, using first one: "
-                    << ExitBlocks[0]->getSymbol()->getName() << "\n");
-  return ExitBlocks[0];
 }
 
 /// Check if two consecutive instructions form a Compare-Branch Fusion sequence
@@ -726,8 +649,10 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   // For Two_Backedge_Uncond pattern, decrement LoopCount since the unconditional
   // branch is not part of the actual loop body
   unsigned AdjustedLoopCount = (Pattern == Two_Backedge_Uncond) ? LoopCount - 1 : LoopCount;
-  return processTightLoop(Loop, MF, Header, AdjustedLoopCount,
-                          BackedgeInfo(BackedgeBranch, Pattern, ExitBlock));
+
+  SmallVector<MachineOperand, 4> EmptyCond;
+  BackedgeInfo BackedgeInfoObj(BackedgeBranch, Pattern, ExitBlock, EmptyCond, EmptyCond);
+  return processTightLoop(Loop, MF, Header, AdjustedLoopCount, BackedgeInfoObj);
 }
 
 void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
@@ -778,7 +703,7 @@ void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
 bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                                      MachineBasicBlock *Header,
                                      unsigned LoopCount,
-                                     const BackedgeInfo &Backedge) {
+                                     BackedgeInfo &Backedge) {
   LLVM_DEBUG({debugPrintLoopInfo(MF, Loop, "Found qualifying", Backedge.ExitBlock);
     dbgs() << "  with Loop count: " << LoopCount << "\n";});
 
@@ -796,18 +721,16 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
 
     // Analyze the original branch to extract condition
-    SmallVector<MachineOperand, 4> Cond;
     MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
-
-    if (TII->analyzeBranch(*Backedge.Branch->getParent(), TBB, FBB, Cond)) {
+    if (TII->analyzeBranch(*Backedge.Branch->getParent(), TBB, FBB, Backedge.Cond)) {
       LLVM_DEBUG(dbgs() << "  Could not analyze branch for unrolling\n");
       ++NumInnerLoopsCannotAnalyzeBranch;
       return false;
     }
 
     // Try to invert the condition
-    SmallVector<MachineOperand, 4> InvertedCond(Cond);
-    if (TII->reverseBranchCondition(InvertedCond)) {
+    Backedge.InvertedCond = Backedge.Cond;
+    if (TII->reverseBranchCondition(Backedge.InvertedCond)) {
       LLVM_DEBUG(dbgs() << "  Unable to invert branch condition, skipping unrolling\n");
       ++NumInnerLoopsFailedCondInversion;
       return false;
@@ -818,7 +741,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
         findBestUnrollCount(LoopCount, Bubbles, MachineWidth);
 
     // Duplicate the loop body with the calculated unroll factor
-    duplicateLoopBody(Loop, UnrollFactor, InvertedCond, Backedge);
+    duplicateLoopBody(Loop, UnrollFactor, Backedge);
     ++NumLoopsUnrolled;
     if (Backedge.Pattern == Two_Backedge_Uncond) {
       ++NumLoopsUnrolledCondUncond;
@@ -866,7 +789,6 @@ unsigned LoopUnrollASM::findBestUnrollCount(unsigned LoopCount,
 
 void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
                                       unsigned UnrollFactor,
-                                      const SmallVectorImpl<MachineOperand> &InvertedCond,
                                       const BackedgeInfo &Backedge) {
   assert (UnrollFactor > 1);
 
@@ -908,11 +830,7 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
     }
   }
 
-  // Analyze the branch in the backedge block to extract condition
-  SmallVector<MachineOperand, 4> Cond;
-  MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
-  const bool failed = TII->analyzeBranch(*BackedgeBlock, TBB, FBB, Cond);
-  assert(!failed && "should be able to analyze branch here");
+  // Use the branch analysis results passed in from the parent function
 
   unsigned TotalInsts = 0;
   for (const auto &Entry : InstsToClone)
@@ -980,13 +898,13 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
           MachineBasicBlock *NextBlock = (i == 0) ? NewBlocks[0][0] : NewBlocks[i][0];
           TII->insertBranch(*CurrentBlock, Backedge.ExitBlock,
                             CurrentBlock->isLayoutSuccessor(NextBlock) ? nullptr : NextBlock,
-                            InvertedCond, Backedge.Branch->getDebugLoc());
+                            Backedge.InvertedCond, Backedge.Branch->getDebugLoc());
         } else {
-          // For the last iteration, branch back to header with inverted condition
+          // For the last iteration, branch back to header with original condition
           // (loop back when we should continue, exit otherwise)
           TII->insertBranch(*CurrentBlock, Header,
                             CurrentBlock->isLayoutSuccessor(Backedge.ExitBlock) ? nullptr : Backedge.ExitBlock,
-                            Cond, Backedge.Branch->getDebugLoc());
+                            Backedge.Cond, Backedge.Branch->getDebugLoc());
         }
       }
 
