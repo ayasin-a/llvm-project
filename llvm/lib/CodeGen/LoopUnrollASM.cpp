@@ -102,6 +102,8 @@ public:
   bool runOnMachineFunction(MachineFunction &MF) override;
 
 private:
+  const TargetInstrInfo *TII = nullptr;
+
   // Static helper function to calculate bubbles
   static unsigned calculateBubbles(unsigned LoopCount) {
     const unsigned MachineWidth = 10;
@@ -112,6 +114,7 @@ private:
   static bool isCompareBranchFusion(const MachineInstr *CompareInst,
                                     const MachineInstr *BranchInst,
                                     const TargetInstrInfo *TII);
+  bool isPostIndexMemOp(const MachineInstr &MI);
   static void debugPrintLoopInfo(MachineFunction &MF, const MachineLoop *Loop,
                           StringRef Prefix, MachineBasicBlock *ExitBlock = nullptr);
   static MachineInstr* findLoopBackedgeBranch(const MachineLoop* Loop);
@@ -135,6 +138,7 @@ INITIALIZE_PASS_END(LoopUnrollASM, DEBUG_TYPE, "Loop Unroll at Assembly Level", 
 
 bool LoopUnrollASM::runOnMachineFunction(MachineFunction &MF) {
   MachineLoopInfo &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
+  TII = MF.getSubtarget().getInstrInfo();
 
   if (MLI.empty())
     return false;
@@ -326,6 +330,52 @@ bool LoopUnrollASM::isCompareBranchFusion(const MachineInstr *CompareInst,
   return false;
 }
 
+/// Check if a memory operation is a post-index operation.
+/// Post-index operations update the base register and are counted with weight 2.
+/// Returns true if the instruction is a post-index memory operation.
+bool LoopUnrollASM::isPostIndexMemOp(const MachineInstr &MI) {
+  if (!MI.mayLoadOrStore() || MI.isTerminator())
+    return false;
+
+  // Check if the instruction modifies its base register
+  // This is a heuristic for post-index addressing modes
+  bool isPostIndex = false;
+
+  // Get the opcode name to check for explicit post-index patterns
+  StringRef OpcodeName = TII->getName(MI.getOpcode());
+
+  // Common patterns for post-index instructions on AArch64
+  if (OpcodeName.contains("_POST") ||      // Explicit POST suffix
+      OpcodeName.contains("PostIndex") ||   // PostIndex suffix
+      OpcodeName.contains_insensitive("writeback")) { // Writeback variant
+    isPostIndex = true;
+  } else {
+    // Check if the instruction has both load/store and register def
+    // This catches instructions that modify their base register
+    for (const MachineOperand &MO : MI.operands()) {
+      if (MO.isReg() && MO.isDef() && !MO.isImplicit()) {
+        // Check if this defined register is also used as a base
+        for (const MachineOperand &UseMO : MI.operands()) {
+          if (UseMO.isReg() && UseMO.isUse() &&
+              UseMO.getReg() == MO.getReg()) {
+            // Same register is both used and defined - likely post-index
+            isPostIndex = true;
+            break;
+          }
+        }
+        if (isPostIndex)
+          break;
+      }
+    }
+  }
+
+  if (isPostIndex) {
+    LLVM_DEBUG(dbgs() << "    Observed post-index instruction in: " << OpcodeName << "\n");
+  }
+
+  return isPostIndex;
+}
+
 bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   // Process inner loops first (depth-first)
   bool Changed = false;
@@ -349,7 +399,6 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   MachineInstr *BackedgeBranch = findLoopBackedgeBranch(Loop);
   unsigned LoopCount = 0;
   SmallVector<MachineInstr *, 4> InternalBranches;
-  const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
 #ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
   bool hasAtomicOps = false;
 #endif
@@ -378,43 +427,8 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       // Check if this is a post-index memory operation
       // Post-index operations update the base register and are typically
       // more complex, so we count them with a weight of 2
-      if (MI.mayLoadOrStore() && !MI.isTerminator()) {
-        // Check if the instruction modifies its base register
-        // This is a heuristic for post-index addressing modes
-        bool isPostIndex = false;
-
-        // Get the opcode name to check for explicit post-index patterns
-        StringRef OpcodeName = TII->getName(MI.getOpcode());
-
-        // Common patterns for post-index instructions on AArch64
-        if (OpcodeName.contains("_POST") ||      // Explicit POST suffix
-            OpcodeName.contains("PostIndex") ||   // PostIndex suffix
-            OpcodeName.contains_insensitive("writeback")) { // Writeback variant
-          isPostIndex = true;
-        } else {
-          // Check if the instruction has both load/store and register def
-          // This catches instructions that modify their base register
-          for (const MachineOperand &MO : MI.operands()) {
-            if (MO.isReg() && MO.isDef() && !MO.isImplicit()) {
-              // Check if this defined register is also used as a base
-              for (const MachineOperand &UseMO : MI.operands()) {
-                if (UseMO.isReg() && UseMO.isUse() &&
-                    UseMO.getReg() == MO.getReg()) {
-                  // Same register is both used and defined - likely post-index
-                  isPostIndex = true;
-                  break;
-                }
-              }
-              if (isPostIndex)
-                break;
-            }
-          }
-        }
-
-        if (isPostIndex) {
-          LLVM_DEBUG(dbgs() << "    Observed post-index instruction in: " << OpcodeName << "\n");
-          ++LoopCount;
-        }
+      if (isPostIndexMemOp(MI)) {
+        ++LoopCount;
       }
 
       // We want to exclude loops with any control flow changing instructions
@@ -718,8 +732,6 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
   // Hanlde the case if the loop would possibly induce +20% Frontend Bound
   if (Bubbles / float(MachineWidth * LoopCycles) > 0.15f) {
     // First, we need to analyze the loop branch to see if we can invert it
-    const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
-
     // Analyze the original branch to extract condition
     MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
     if (TII->analyzeBranch(*Backedge.Branch->getParent(), TBB, FBB, Backedge.Cond)) {
@@ -795,7 +807,6 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   MachineLoopInfo &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
   MachineBasicBlock *Header = Loop->getHeader();
   MachineFunction *MF = Header->getParent();
-  const TargetInstrInfo *TII = MF->getSubtarget().getInstrInfo();
   MachineBasicBlock *BackedgeBlock = Backedge.Branch->getParent();
 
   // This ensures we only insert one branch instruction (conditional) instead of two
