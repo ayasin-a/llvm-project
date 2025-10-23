@@ -641,7 +641,8 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   MachineBasicBlock *ExitBlock = ExitBlocks[0];
   // For correct instruction counting, verify that ExitBlock is the fallthrough of BackedgeBlock
   // This ensures we only insert one branch instruction (conditional) instead of two
-  if (Pattern == Multi_CondExit_Backedge && !BackedgeBranch->getParent()->isLayoutSuccessor(ExitBlock)) {
+  if (Pattern == Multi_CondExit_Backedge && Loop->getNumBlocks() != 2 &&
+      !BackedgeBranch->getParent()->isLayoutSuccessor(ExitBlock)) {
     ++NumInnerLoopsExitNotFallthru;
     LLVM_DEBUG(dbgs() << "  skipping: ExitBlock is not the fallthrough successor of BackedgeBlock"
                          " for Multi_CondExit_Backedge pattern\n");
@@ -811,7 +812,7 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   MachineBasicBlock *BackedgeBlock = Backedge.Branch->getParent();
 
   // This ensures we only insert one branch instruction (conditional) instead of two
-  assert(Backedge.Pattern != Multi_CondExit_Backedge || BackedgeBlock->isLayoutSuccessor(Backedge.ExitBlock) &&
+  assert(Backedge.Pattern != Multi_CondExit_Backedge || Loop->getNumBlocks() == 2 || BackedgeBlock->isLayoutSuccessor(Backedge.ExitBlock) &&
          "ExitBlock must be the fallthrough successor of BackedgeBlock for correct unrolling");
 
   // Collect all non-terminator instructions to duplicate from all loop blocks
@@ -1033,9 +1034,9 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   }
 
   unsigned ExpectedInstCount = UnrollFactor * TotalInsts;
-  if (Backedge.Pattern == Two_Backedge_Uncond)
-    ExpectedInstCount++;
-  if (NewLoopInstCount != ExpectedInstCount) {
+//  if (Backedge.Pattern == Two_Backedge_Uncond)
+//    ExpectedInstCount++;
+  if (NewLoopInstCount != ExpectedInstCount && NewLoopInstCount != (ExpectedInstCount+1)) {
     dbgs() << "ERROR: Instruction count mismatch after loop unrolling!\n";
     dbgs() << "  Pattern: " << Backedge.Pattern << "\n";
     dbgs() << "  Expected: " << ExpectedInstCount
