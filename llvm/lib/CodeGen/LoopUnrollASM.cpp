@@ -727,10 +727,11 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
   const unsigned MachineWidth = 10;
   const unsigned LoopCycles =
       (LoopCount + MachineWidth - 1) / MachineWidth; // round-up int divide
+  const float FetchBubblesThreshold = 0.20f;
 
   unsigned Bubbles = calculateBubbles(LoopCount);
   // Hanlde the case if the loop would possibly induce +20% Frontend Bound
-  if (Bubbles / float(MachineWidth * LoopCycles) > 0.15f) {
+  if (Bubbles / float(MachineWidth * LoopCycles) > FetchBubblesThreshold) {
     // First, we need to analyze the loop branch to see if we can invert it
     // Analyze the original branch to extract condition
     MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
