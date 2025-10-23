@@ -56,6 +56,7 @@ STATISTIC(NumInnerLoopsExitNotFallthru, "Number of inner loops skipped (ExitBloc
 STATISTIC(NumInnerLoopsCannotAnalyzeBranch, "Number of tight loops skipped (cannot analyze branch)");
 STATISTIC(NumInnerLoopsFailedCondInversion, "Number of loops skipped due to branch inversion failure");
 STATISTIC(NumInnerLoops_BackedgeFallthruHeader, "Number of inner loops where Backedge branch fallsthrough into Loop Header");
+STATISTIC(NumInnerLoops_InvalidUncondExit, "Number of inner loops ending with weird unconditional exit branch");
 
 static cl::opt<unsigned> LoopUnrollASMMaxInsts(
     "loop-unroll-asm-max-insts",
@@ -76,12 +77,14 @@ struct BackedgeInfo {
   MachineBasicBlock *ExitBlock;
   SmallVector<MachineOperand, 4> Cond;
   SmallVector<MachineOperand, 4> InvertedCond;
+  bool EndsWithUncondExit;
 
   BackedgeInfo(MachineInstr *Branch, TerminatorPattern Pattern, MachineBasicBlock *ExitBlock,
                const SmallVectorImpl<MachineOperand> &Cond,
-               const SmallVectorImpl<MachineOperand> &InvertedCond)
+               const SmallVectorImpl<MachineOperand> &InvertedCond,
+               bool EndsWithUncondExit = false)
     : Branch(Branch), Pattern(Pattern), ExitBlock(ExitBlock), Cond(Cond.begin(), Cond.end()),
-      InvertedCond(InvertedCond.begin(), InvertedCond.end()) {}
+      InvertedCond(InvertedCond.begin(), InvertedCond.end()), EndsWithUncondExit(EndsWithUncondExit) {}
 };
 
 class LoopUnrollASM : public MachineFunctionPass {
@@ -413,23 +416,12 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         continue;
 
       ++LoopCount;
-
-      // Check for Compare-Branch Fusion pattern
-      // If current instruction is a branch and previous was a compare,
-      // check if they can be fused
-      if (PrevInst && MI.isBranch() && !MI.isPseudo() &&
-          isCompareBranchFusion(PrevInst, &MI, TII)) {
-        // Fusion detected - decrement LoopCount as these two instructions
-        // execute as a single fused operation
+      if (PrevInst && MI.isBranch() && isCompareBranchFusion(PrevInst, &MI, TII))
+        // Compare-Branch pair get fused into one operation
         --LoopCount;
-      }
-
-      // Check if this is a post-index memory operation
-      // Post-index operations update the base register and are typically
-      // more complex, so we count them with a weight of 2
-      if (isPostIndexMemOp(MI)) {
+      else if (isPostIndexMemOp(MI))
+        // Post-index operations translate into 2 operations
         ++LoopCount;
-      }
 
       // We want to exclude loops with any control flow changing instructions
       // (branches, calls, returns) except for the terminator
@@ -500,9 +492,27 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   unsigned NumTerminators = Terminators.size();
   TerminatorPattern Pattern = NumTerminators == 1 ? One_Backedge : Nonsupported;
 
+  // Traverse the backedge branch's block backwards to determine if loop ends with
+  // unconditional branch somewhere outside the loop.
+  MachineInstr *lastUnconditionalExitBranch = nullptr;
+  if (MachineBasicBlock *BackedgeBlock = BackedgeBranch ? BackedgeBranch->getParent() : nullptr) {
+    for (auto I = BackedgeBlock->rbegin(); I != BackedgeBlock->rend(); ++I) {
+      MachineInstr &MI = *I;
+      // Skip debug and pseudo instructions
+      if (MI.isDebugInstr() || MI.isPseudo())
+        continue;
+
+      if (MI.isUnconditionalBranch() && branchTargetsExit(&MI)) {
+        lastUnconditionalExitBranch = &MI;
+        LLVM_DEBUG(dbgs() << "  Loop ends with unconditional exit branch\n");
+      }
+      break; // Found the first valid instruction before backedge
+    }
+  }
+
   // Check if this is a loop with multiple terminators where all non-backedge terminators target exit
-  // Pattern: Multiple conditional exit branches + One backedge = Multi_CondExit_Backedge
-  LLVM_DEBUG({dbgs() << "  info: NumTerminators=" << NumTerminators << "\n";
+  LLVM_DEBUG({dbgs() << "  info: NumTerminators=" << NumTerminators
+              << "endsUncondExitBranch" << (lastUnconditionalExitBranch != nullptr) << "\n";
     for (auto T: Terminators)
       dbgs() << "    info: cond=" << T->isConditionalBranch() <<
                 " branchTargetsExit=" << branchTargetsExit(T) <<
@@ -531,6 +541,10 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         // Pattern 1: conditional branch followed by unconditional branch
         Pattern = Two_Backedge_Uncond;
         LLVM_DEBUG(dbgs() << "  Detected Two_Backedge_Uncond pattern\n");
+        if (Last != lastUnconditionalExitBranch) {
+          ++NumInnerLoops_InvalidUncondExit;
+          LLVM_DEBUG(dbgs() << "    Last != lastUnconditionalExitBranc\n");
+        }
       }
     }
 
@@ -538,38 +552,45 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     // In some cases (e.g., when there are no terminators), Last may not be a branch
     if (Pattern == Nonsupported && !Last->isBranch()) {
       ++NumInnerLoopsInvalid;
-      LLVM_DEBUG(dbgs() << "  skipping: Invalid loop: Last instruction is not a branch\n");
-      return Changed;
+      LLVM_DEBUG(dbgs() << "  warning: Invalid loop: Last instruction is not a branch\n");
+      //return Changed;
     }
   }
+  if (NumTerminators > 1) {
+    // TODO: this may replace the more complex Latch based logic above
+    if (Pattern == Nonsupported && lastUnconditionalExitBranch && NumTerminators == 2 && BackedgeBranch) {
+      Pattern = Two_Backedge_Uncond;
+      LLVM_DEBUG(dbgs() << "  Detected Two_Backedge_Uncond pattern; fixup\n");
+    }
 
-  // Check if all terminators except BackedgeBranch target the exit
-  if (Pattern == Nonsupported && NumTerminators > 1 && BackedgeBranch) {
-    bool allOthersTargetExit = true;
-    for (auto T : Terminators) {
-      if ((T != BackedgeBranch && !branchTargetsExit(T)) ||
-          !T->isConditionalBranch()) {
-        allOthersTargetExit = false;
-        break;
+    // Check if all terminators except BackedgeBranch target the exit
+    // can now override a previous Two_Backedge_Uncond pattern
+    else if (BackedgeBranch) {
+      bool allOthersTargetExit = true;
+      for (auto T : Terminators) {
+        if ((T != BackedgeBranch && !branchTargetsExit(T))) {
+          allOthersTargetExit = false;
+          break;
+        }
+      }
+      if (allOthersTargetExit) {
+        Pattern = Multi_CondExit_Backedge;
+        LLVM_DEBUG(dbgs() << "  Detected Multi_CondExit_Backedge pattern ("
+                          << NumTerminators << " terminators: exit branches + backedge)\n");
       }
     }
-    if (allOthersTargetExit) {
-      Pattern = Multi_CondExit_Backedge;
-      LLVM_DEBUG(dbgs() << "  Detected Multi_CondExit_Backedge pattern ("
-                        << NumTerminators << " terminators: exit branches + backedge)\n");
-    }
-  }
 
-  if (Pattern == Nonsupported) {
-    if (NumTerminators == 2)
-      ++NumInnerLoopsMultipleTerminators2;
-    else if (NumTerminators == 3)
-      ++NumInnerLoopsMultipleTerminators3;
-    else if (NumTerminators >= 4)
-      ++NumInnerLoopsMultipleTerminators4Plus;
-    LLVM_DEBUG(dbgs() << "  skipping: Multiple terminators (" << NumTerminators << ", not accepted pattern)\n");
-    return Changed;
-  }
+    if (Pattern == Nonsupported) {
+      if (NumTerminators == 2)
+        ++NumInnerLoopsMultipleTerminators2;
+      else if (NumTerminators == 3)
+        ++NumInnerLoopsMultipleTerminators3;
+      else if (NumTerminators >= 4)
+        ++NumInnerLoopsMultipleTerminators4Plus;
+      LLVM_DEBUG(dbgs() << "  skipping: Multiple terminators (" << NumTerminators << ", not accepted pattern)\n");
+      return Changed;
+    }
+  } // NumTerminators > 1
 
   if (!BackedgeBranch) {
     ++NumInnerLoopsBranchConditionalNoBackedge;
@@ -607,9 +628,8 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
   assert(BackedgeBranch->isConditionalBranch() && "Loop with non-conditional backedge branch!");
 
-  // Check if this is a single basic block loop (Head == Latch)
-  // Exception: Multi_CondExit_Backedge pattern can have multiple blocks
-  if (Pattern != Multi_CondExit_Backedge && (!Header || !Latch || Header != Latch)) {
+  // require a single basic block loop if pattern isn't recognized
+  if (Pattern == Nonsupported && (!Header || !Latch || Header != Latch)) {
     ++NumInnerLoopsNotSingleBB;
     LLVM_DEBUG(dbgs() << "  skipping: Not single BB (Header != Latch)\n");
     return Changed;
@@ -660,12 +680,12 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     return Changed;
   }
 
-  // For Two_Backedge_Uncond pattern, decrement LoopCount since the unconditional
-  // branch is not part of the actual loop body
-  unsigned AdjustedLoopCount = (Pattern == Two_Backedge_Uncond) ? LoopCount - 1 : LoopCount;
+  // an unconditional exit branch that ends a loop won't be unrolled
+  unsigned AdjustedLoopCount = lastUnconditionalExitBranch ? LoopCount - 1 : LoopCount;
 
   SmallVector<MachineOperand, 4> EmptyCond;
-  BackedgeInfo BackedgeInfoObj(BackedgeBranch, Pattern, ExitBlock, EmptyCond, EmptyCond);
+  BackedgeInfo BackedgeInfoObj(BackedgeBranch, Pattern, ExitBlock, EmptyCond, EmptyCond,
+                                lastUnconditionalExitBranch != nullptr);
   return processTightLoop(Loop, MF, Header, AdjustedLoopCount, BackedgeInfoObj);
 }
 
@@ -1033,7 +1053,7 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   }
 
   unsigned ExpectedInstCount = UnrollFactor * TotalInsts;
-  if (Backedge.Pattern == Two_Backedge_Uncond)
+  if (Backedge.EndsWithUncondExit)
     ExpectedInstCount++;
   if (NewLoopInstCount != ExpectedInstCount) {
     dbgs() << "ERROR: Instruction count mismatch after loop unrolling!\n";
