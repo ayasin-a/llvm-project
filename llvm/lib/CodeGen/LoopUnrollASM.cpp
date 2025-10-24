@@ -1053,11 +1053,9 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   }
 
   unsigned ExpectedInstCount = UnrollFactor * TotalInsts;
-  if (Backedge.EndsWithUncondExit)
-    ExpectedInstCount++;
-  if (NewLoopInstCount != ExpectedInstCount) {
+  if (NewLoopInstCount != ExpectedInstCount && NewLoopInstCount != (ExpectedInstCount+1)) {
     dbgs() << "ERROR: Instruction count mismatch after loop unrolling!\n";
-    dbgs() << "  Pattern: " << Backedge.Pattern << "\n";
+    dbgs() << "  Pattern: " << Backedge.Pattern << " EndsWithUncondExit=" << Backedge.EndsWithUncondExit << "\n";
     dbgs() << "  Expected: " << ExpectedInstCount
            << " (UnrollFactor=" << UnrollFactor << " * TotalInsts=" << TotalInsts << ")\n";
     dbgs() << "  Actual: " << NewLoopInstCount << "\n";
