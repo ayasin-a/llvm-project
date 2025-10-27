@@ -63,6 +63,11 @@ static cl::opt<unsigned> LoopUnrollASMMaxInsts(
     cl::desc("Maximum number of instructions in a loop for LoopUnrollASM to process"),
     cl::init(46), cl::Hidden);
 
+static cl::opt<float> LoopUnrollASMFetchBubblesThreshold(
+    "loop-unroll-asm-fetch-bubbles-threshold",
+    cl::desc("Threshold for fetch bubbles ratio to trigger loop unrolling"),
+    cl::init(0.20f), cl::Hidden);
+
 namespace {
 enum TerminatorPattern {
   Nonsupported = 0,
@@ -779,11 +784,10 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
   const unsigned MachineWidth = 10;
   const unsigned LoopCycles =
       (LoopCount + MachineWidth - 1) / MachineWidth; // round-up int divide
-  const float FetchBubblesThreshold = 0.20f;
 
   unsigned Bubbles = calculateBubbles(LoopCount);
   // Hanlde the case if the loop would possibly induce +20% Frontend Bound
-  if (Bubbles / float(MachineWidth * LoopCycles) > FetchBubblesThreshold) {
+  if (Bubbles / float(MachineWidth * LoopCycles) > LoopUnrollASMFetchBubblesThreshold) {
     // First, we need to analyze the loop branch to see if we can invert it
     // Analyze the original branch to extract condition
     MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
