@@ -512,7 +512,9 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 
   // Check if this is a loop with multiple terminators where all non-backedge terminators target exit
   LLVM_DEBUG({dbgs() << "  info: NumTerminators=" << NumTerminators
-              << "endsUncondExitBranch" << (lastUnconditionalExitBranch != nullptr) << "\n";
+                     << " endsUncondExitBranch=" << (lastUnconditionalExitBranch != nullptr)
+                     << " InternalBranches=" << InternalBranches.size()
+                     << "\n";
     for (auto T: Terminators)
       dbgs() << "    info: cond=" << T->isConditionalBranch() <<
                 " branchTargetsExit=" << branchTargetsExit(T) <<
@@ -628,8 +630,9 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
   assert(BackedgeBranch->isConditionalBranch() && "Loop with non-conditional backedge branch!");
 
-  // require a single basic block loop if pattern isn't recognized
-  if (Pattern == Nonsupported && (!Header || !Latch || Header != Latch)) {
+  // Check if this is a single basic block loop (Head == Latch)
+  // Exception: Multi_CondExit_Backedge pattern can have multiple blocks
+  if (Pattern != Multi_CondExit_Backedge && (!Header || !Latch || Header != Latch)) {
     ++NumInnerLoopsNotSingleBB;
     LLVM_DEBUG(dbgs() << "  skipping: Not single BB (Header != Latch)\n");
     return Changed;
@@ -716,12 +719,31 @@ void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
       }
       dbgs() << "\n";
     }
-    dbgs() << "  Header=" << Header->getSymbol()->getName() << ", BasicBlocks in layout order: ";
+
+    // Helper lambda to print block name (use number if symbol name is empty)
+    auto printBlockName = [](const MachineBasicBlock *MBB) {
+      if (MCSymbol *Sym = MBB->getSymbol()) {
+        StringRef Name = Sym->getName();
+        if (!Name.empty()) {
+          dbgs() << Name;
+          return;
+        }
+      }
+      dbgs() << "BB#" << MBB->getNumber();
+    };
+
+    dbgs() << "  Header=";
+    printBlockName(Header);
+    dbgs() << ", BasicBlocks in layout order: ";
     for (MachineBasicBlock &MBB : MF)
-      if (Loop->contains(&MBB))
-        dbgs() << MBB.getSymbol()->getName() << " , ";
-    if (ExitBlock)
-      dbgs() << "  ExitBlock: " << ExitBlock->getSymbol()->getName();
+      if (Loop->contains(&MBB)) {
+        printBlockName(&MBB);
+        dbgs() << " , ";
+      }
+    if (ExitBlock) {
+      dbgs() << "  ExitBlock: ";
+      printBlockName(ExitBlock);
+    }
     dbgs() << "\n";
   });
 }
