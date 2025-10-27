@@ -63,6 +63,11 @@ static cl::opt<unsigned> LoopUnrollASMMaxInsts(
     cl::desc("Maximum number of instructions in a loop for LoopUnrollASM to process"),
     cl::init(46), cl::Hidden);
 
+static cl::opt<bool> LoopUnrollASMForce(
+    "loop-unroll-asm-force",
+    cl::desc("Force loop unrolling even when layout checks would normally skip"),
+    cl::init(true), cl::Hidden);
+
 namespace {
 enum TerminatorPattern {
   Nonsupported = 0,
@@ -664,7 +669,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   MachineBasicBlock *ExitBlock = ExitBlocks[0];
   // For correct instruction counting, verify that ExitBlock is the fallthrough of BackedgeBlock
   // This ensures we only insert one branch instruction (conditional) instead of two
-  if (Pattern == Multi_CondExit_Backedge && !BackedgeBranch->getParent()->isLayoutSuccessor(ExitBlock)) {
+  if (!LoopUnrollASMForce && Pattern == Multi_CondExit_Backedge && !BackedgeBranch->getParent()->isLayoutSuccessor(ExitBlock)) {
     ++NumInnerLoopsExitNotFallthru;
     LLVM_DEBUG(dbgs() << "  skipping: ExitBlock is not the fallthrough successor of BackedgeBlock"
                          " for Multi_CondExit_Backedge pattern\n");
@@ -760,9 +765,6 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                                      MachineBasicBlock *Header,
                                      unsigned LoopCount,
                                      BackedgeInfo &Backedge) {
-  LLVM_DEBUG({debugPrintLoopInfo(MF, Loop, "Found qualifying", Backedge.ExitBlock);
-    dbgs() << "  with Loop count: " << LoopCount << "\n";});
-
   ++NumLoopsDetected;
 
   // TODO: get MachineWidth from TTI / SchedModel
@@ -778,9 +780,18 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     // Analyze the original branch to extract condition
     MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
     if (TII->analyzeBranch(*Backedge.Branch->getParent(), TBB, FBB, Backedge.Cond)) {
-      LLVM_DEBUG(dbgs() << "  Could not analyze branch for unrolling\n");
+      LLVM_DEBUG(dbgs() << "  Unable to analyze branch for unrolling\n");
       ++NumInnerLoopsCannotAnalyzeBranch;
       return false;
+    }
+
+    // Fall-through could vary in case of conditional branch with fall-through (FBB==null)
+    if (TBB && !FBB) {
+      MachineBasicBlock *FallthroughBB = Backedge.Branch->getParent()->getNextNode();
+      if (FallthroughBB && FallthroughBB != Backedge.ExitBlock) {
+        LLVM_DEBUG(dbgs() << "  saw a different fallthrough vs exit blocks\n");
+        Backedge.ExitBlock = FallthroughBB;
+      }
     }
 
     // Try to invert the condition
@@ -791,12 +802,9 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
       return false;
     }
 
-    // Determine the best unroll factor based on minimizing bubbles
-    unsigned UnrollFactor =
-        findBestUnrollCount(LoopCount, Bubbles, MachineWidth);
-
-    // Duplicate the loop body with the calculated unroll factor
-    duplicateLoopBody(Loop, UnrollFactor, Backedge);
+    LLVM_DEBUG({debugPrintLoopInfo(MF, Loop, "Found qualifying", Backedge.ExitBlock);
+      dbgs() << "  with Loop count: " << LoopCount << "\n";});
+    duplicateLoopBody(Loop, findBestUnrollCount(LoopCount, Bubbles, MachineWidth), Backedge);
     ++NumLoopsUnrolled;
     if (Backedge.Pattern == Two_Backedge_Uncond) {
       ++NumLoopsUnrolledCondUncond;
@@ -805,6 +813,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     }
     return true;
   }
+  LLVM_DEBUG(dbgs() << "  bubbles are good\n");
 
   ++NumLoopsNotEnoughBubbles;
   return false;
@@ -853,7 +862,8 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   MachineBasicBlock *BackedgeBlock = Backedge.Branch->getParent();
 
   // This ensures we only insert one branch instruction (conditional) instead of two
-  assert(Backedge.Pattern != Multi_CondExit_Backedge || BackedgeBlock->isLayoutSuccessor(Backedge.ExitBlock) &&
+  assert((LoopUnrollASMForce || Backedge.Pattern != Multi_CondExit_Backedge ||
+          BackedgeBlock->isLayoutSuccessor(Backedge.ExitBlock)) &&
          "ExitBlock must be the fallthrough successor of BackedgeBlock for correct unrolling");
 
   // Collect all non-terminator instructions to duplicate from all loop blocks
@@ -890,10 +900,7 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   for (const auto &Entry : InstsToClone)
     TotalInsts += Entry.second.size();
   TotalInsts += 1; // for Backedge terminator
-  LLVM_DEBUG({
-    dbgs() << "  Original loop body has " << TotalInsts << " instructions "
-              "spanning " << Loop->getNumBlocks() << " block(s).\n";
-  });
+  LLVM_DEBUG(dbgs() << "  Original loop has " << TotalInsts << " instructions spanning " << Loop->getNumBlocks() << " blocks.\n");
 
   // We need to create new basic blocks for proper control flow
   // The structure will be:
@@ -912,13 +919,9 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
     for (MachineBasicBlock *OrigMBB : LoopBlocksInOrder) {
       MachineBasicBlock *NewBB = MF->CreateMachineBasicBlock();
       MF->insert(++MachineFunction::iterator(PrevBlock), NewBB);
-
       // Copy live-in registers from the original block
-      // These registers are needed by the cloned instructions
-      for (const auto &LI : OrigMBB->liveins()) {
+      for (const auto &LI : OrigMBB->liveins())
         NewBB->addLiveIn(LI.PhysReg);
-      }
-
       NewBlocks[i - 1].push_back(NewBB);
       PrevBlock = NewBB;
     }
@@ -949,9 +952,8 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
         if (i < UnrollFactor - 1) {
           // For all but the last iteration, use the inverted conditional branch
           // Branch to exit on condition, or continue to next iteration's first block
-          MachineBasicBlock *NextBlock = (i == 0) ? NewBlocks[0][0] : NewBlocks[i][0];
-          TII->insertBranch(*CurrentBlock, Backedge.ExitBlock,
-                            CurrentBlock->isLayoutSuccessor(NextBlock) ? nullptr : NextBlock,
+          assert(CurrentBlock->isLayoutSuccessor(NewBlocks[i][0]) && "NewBlock not Successor when duplicating!");
+          TII->insertBranch(*CurrentBlock, Backedge.ExitBlock, nullptr,
                             Backedge.InvertedCond, Backedge.Branch->getDebugLoc());
         } else {
           // For the last iteration, branch back to header with original condition
@@ -1084,9 +1086,8 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
 
     debugPrintLoopInfo(*MF, Loop, " ", Backedge.ExitBlock);
 
-    // Debug: print instruction counts per block
-    dbgs() << "  Instruction counts per block:\n";
-    for (MachineBasicBlock *MBB : Loop->blocks()) {
+    dbgs() << "  Instruction counts per block of original loop:\n";
+    for (MachineBasicBlock *MBB : LoopBlocksInOrder) {
       unsigned BlockInstCount = 0;
       dbgs() << "    Block " << MBB->getNumber() << ":\n";
       for (MachineInstr &MI : *MBB) {
