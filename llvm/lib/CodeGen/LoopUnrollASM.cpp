@@ -558,7 +558,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       //return Changed;
     }
   }
-  if (NumTerminators > 1) {
+  if (NumTerminators > 1 && Pattern == Nonsupported) {
     // TODO: this may replace the more complex Latch based logic above
     if (Pattern == Nonsupported && lastUnconditionalExitBranch && NumTerminators == 2 && BackedgeBranch) {
       Pattern = Two_Backedge_Uncond;
