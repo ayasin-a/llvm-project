@@ -33,29 +33,30 @@ using namespace llvm;
 
 #define DEBUG_TYPE "loop-unroll-asm"
 
+// totals
 STATISTIC(NumLoopsDetected, "Number of tight loops detected by LoopUnrollASM");
 STATISTIC(NumLoopsUnrolled, "Number of tight loops unrolled by LoopUnrollASM");
 STATISTIC(NumLoopsUnrolledCondUncond, "Number of tight loops unrolled with cond+uncond terminators");
 STATISTIC(NumLoopsUnrolledMultiCondExit, "Number of tight loops unrolled with multi-cond-exit+backedge pattern");
 STATISTIC(NumLoopsNotEnoughBubbles, "Number of tight loops skipped (not enough bubbles)");
-STATISTIC(NumInnermostLoops, "Number of inner loops skipped (not innermost)");
-STATISTIC(NumInnerLoopsNotSingleLatch, "Number of inner loops skipped (not single latch)");
+STATISTIC(NumInnermostLoops, "Number of inner-most loops");
+// skipped; inner denotes innermost.
 STATISTIC(NumInnerLoopsNotSingleBB, "Number of inner loops skipped (Header != Latch)");
-STATISTIC(NumInnerLoopsMultipleTerminators2, "Number of inner loops skipped (2 terminators, non-standard)");
+STATISTIC(NumInnerLoopsMultipleTerminators2, "Number of inner loops skipped (2 terminators)");
 STATISTIC(NumInnerLoopsMultipleTerminators3, "Number of inner loops skipped (3 terminators)");
 STATISTIC(NumInnerLoopsMultipleTerminators4Plus, "Number of inner loops skipped (4+ terminators)");
 STATISTIC(NumInnerLoopsInvalid, "Number of inner loops skipped (invalid)");
 STATISTIC(NumInnerLoopsBranchUnconditional, "Number of inner loops skipped (unconditional branch)");
-STATISTIC(NumInnerLoopsBranchUnconditionalWithSingleCondInternal, "Number of inner loops skipped (unconditional branch with single conditional internal)");
 STATISTIC(NumInnerLoopsBranchIndirect, "Number of inner loops skipped (indirect branch)");
 STATISTIC(NumInnerLoopsBranchConditionalNoBackedge, "Number of inner loops skipped (conditional branch without backedge)");
 STATISTIC(NumInnerLoopsHasAtomicOps, "Number of inner loops skipped (has atomic ops)");
 STATISTIC(NumInnerLoopsHasInternalBranch, "Number of inner loops skipped (has internal branch)");
 STATISTIC(NumInnerLoopsTooManyInsts, "Number of inner loops skipped (too many instructions)");
-STATISTIC(NumInnerLoopsCannotAnalyzeBranch, "Number of tight loops skipped (cannot analyze branch)");
-STATISTIC(NumInnerLoopsFailedCondInversion, "Number of loops skipped due to branch inversion failure");
+STATISTIC(NumInnerLoopsBranchPrepFailure, "Number of loops skipped (branch analysis or condition inversion failed)");
+// dev stats
 STATISTIC(NumInnerLoops_BackedgeFallthruHeader, "Number of inner loops where Backedge branch fallsthrough into Loop Header");
 STATISTIC(NumInnerLoops_InvalidUncondExit, "Number of inner loops ending with weird unconditional exit branch");
+STATISTIC(NumInnerLoops_LastInstNotBranch, "Number of inner loops where last instruction is not a branch");
 
 static cl::opt<unsigned> LoopUnrollASMMaxInsts(
     "loop-unroll-asm-max-insts",
@@ -117,6 +118,7 @@ private:
                                     const MachineInstr *BranchInst,
                                     const TargetInstrInfo *TII);
   bool isPostIndexMemOp(const MachineInstr &MI);
+  static bool isLoopSimplifyForm(const MachineLoop *Loop);
   static void debugPrintLoopInfo(MachineFunction &MF, const MachineLoop *Loop,
                           StringRef Prefix, MachineBasicBlock *ExitBlock = nullptr);
   static MachineInstr* findLoopBackedgeBranch(const MachineLoop* Loop);
@@ -378,6 +380,32 @@ bool LoopUnrollASM::isPostIndexMemOp(const MachineInstr &MI) {
   return isPostIndex;
 }
 
+/// Check if a MachineLoop is in loop simplify form.
+/// A loop in simplify form has:
+/// - A preheader (single predecessor outside the loop)
+/// - A single latch (single block with backedge to header)
+/// - Dedicated exits (all exit blocks have all predecessors inside the loop)
+bool LoopUnrollASM::isLoopSimplifyForm(const MachineLoop *Loop) {
+  // Check for preheader and single latch
+  if (!Loop->getLoopPreheader() || !Loop->getLoopLatch())
+    return false;
+
+  // Check for dedicated exits: all exit blocks must have all predecessors inside the loop
+  SmallVector<MachineBasicBlock*, 8> ExitBlocks;
+  Loop->getExitBlocks(ExitBlocks);
+
+  for (MachineBasicBlock *ExitBB : ExitBlocks) {
+    for (MachineBasicBlock *Pred : ExitBB->predecessors()) {
+      if (!Loop->contains(Pred)) {
+        // Found a predecessor outside the loop - not dedicated exits
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
 bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   // Process inner loops first (depth-first)
   bool Changed = false;
@@ -511,13 +539,14 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 
   // Check if this is a loop with multiple terminators where all non-backedge terminators target exit
   LLVM_DEBUG({dbgs() << "  info: NumTerminators=" << NumTerminators
+                     << " isLoopSimplifyForm=" << isLoopSimplifyForm(Loop)
                      << " endsUncondExitBranch=" << (lastUnconditionalExitBranch != nullptr)
                      << " InternalBranches=" << InternalBranches.size()
                      << "\n";
     for (auto T: Terminators)
       dbgs() << "    info: cond=" << T->isConditionalBranch() <<
                 " branchTargetsExit=" << branchTargetsExit(T) <<
-                " backedge=" << (T == BackedgeBranch) << "\n";
+                " backedge=" << (T == BackedgeBranch) << " " << *T;
   });
 
   MachineBasicBlock *Latch = Loop->getLoopLatch();
@@ -552,7 +581,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     // Check if the last instruction is actually a branch
     // In some cases (e.g., when there are no terminators), Last may not be a branch
     if (Pattern == Nonsupported && !Last->isBranch()) {
-      ++NumInnerLoopsInvalid;
+      ++NumInnerLoops_LastInstNotBranch;
       LLVM_DEBUG(dbgs() << "  warning: Invalid loop: Last instruction is not a branch\n");
       //return Changed;
     }
@@ -601,18 +630,11 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 
   SmallVector<MachineBasicBlock *, 4> Latches;
   Loop->getLoopLatches(Latches);
-  if (Latches.size() != 1) {
-    ++NumInnerLoopsNotSingleLatch;
-    LLVM_DEBUG(dbgs() << "  skipping: Not single latch\n");
-    return Changed;
-  }
+  assert(Latches.size() == 1 && "Loop must have single latch");
 
   // Classify the branch type and skip if not suitable for unrolling
   if (BackedgeBranch->isUnconditionalBranch()) {
     ++NumInnerLoopsBranchUnconditional;
-    // Sub-case: check if there's a single internal conditional branch
-    if (InternalBranches.size() == 1 && InternalBranches[0]->isConditionalBranch())
-      ++NumInnerLoopsBranchUnconditionalWithSingleCondInternal;
     LLVM_DEBUG(dbgs() << "  skipping: Unconditional branch\n");
     // TODO: we should be able to unroll simple cases like:
     // Loop:  inst1
@@ -767,7 +789,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
     if (TII->analyzeBranch(*Backedge.Branch->getParent(), TBB, FBB, Backedge.Cond)) {
       LLVM_DEBUG(dbgs() << "  Unable to analyze branch for unrolling\n");
-      ++NumInnerLoopsCannotAnalyzeBranch;
+      ++NumInnerLoopsBranchPrepFailure;
       return false;
     }
 
@@ -784,7 +806,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     Backedge.InvertedCond = Backedge.Cond;
     if (TII->reverseBranchCondition(Backedge.InvertedCond)) {
       LLVM_DEBUG(dbgs() << "  Unable to invert branch condition, skipping unrolling\n");
-      ++NumInnerLoopsFailedCondInversion;
+      ++NumInnerLoopsBranchPrepFailure;
       return false;
     }
 
