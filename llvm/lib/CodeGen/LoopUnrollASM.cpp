@@ -52,7 +52,6 @@ STATISTIC(NumInnerLoopsBranchConditionalNoBackedge, "Number of inner loops skipp
 STATISTIC(NumInnerLoopsHasAtomicOps, "Number of inner loops skipped (has atomic ops)");
 STATISTIC(NumInnerLoopsHasInternalBranch, "Number of inner loops skipped (has internal branch)");
 STATISTIC(NumInnerLoopsTooManyInsts, "Number of inner loops skipped (too many instructions)");
-STATISTIC(NumInnerLoopsExitNotFallthru, "Number of inner loops skipped (ExitBlock isn't fallthrough of BackedgeBlock)");
 STATISTIC(NumInnerLoopsCannotAnalyzeBranch, "Number of tight loops skipped (cannot analyze branch)");
 STATISTIC(NumInnerLoopsFailedCondInversion, "Number of loops skipped due to branch inversion failure");
 STATISTIC(NumInnerLoops_BackedgeFallthruHeader, "Number of inner loops where Backedge branch fallsthrough into Loop Header");
@@ -62,11 +61,6 @@ static cl::opt<unsigned> LoopUnrollASMMaxInsts(
     "loop-unroll-asm-max-insts",
     cl::desc("Maximum number of instructions in a loop for LoopUnrollASM to process"),
     cl::init(46), cl::Hidden);
-
-static cl::opt<bool> LoopUnrollASMForce(
-    "loop-unroll-asm-force",
-    cl::desc("Force loop unrolling even when layout checks would normally skip"),
-    cl::init(true), cl::Hidden);
 
 namespace {
 enum TerminatorPattern {
@@ -667,14 +661,6 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     return Changed;
   }
   MachineBasicBlock *ExitBlock = ExitBlocks[0];
-  // For correct instruction counting, verify that ExitBlock is the fallthrough of BackedgeBlock
-  // This ensures we only insert one branch instruction (conditional) instead of two
-  if (!LoopUnrollASMForce && Pattern == Multi_CondExit_Backedge && !BackedgeBranch->getParent()->isLayoutSuccessor(ExitBlock)) {
-    ++NumInnerLoopsExitNotFallthru;
-    LLVM_DEBUG(dbgs() << "  skipping: ExitBlock is not the fallthrough successor of BackedgeBlock"
-                         " for Multi_CondExit_Backedge pattern\n");
-    return Changed;
-  }
 
   if (!InternalBranches.empty()) {
     ++NumInnerLoopsHasInternalBranch;
@@ -860,11 +846,6 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   MachineBasicBlock *Header = Loop->getHeader();
   MachineFunction *MF = Header->getParent();
   MachineBasicBlock *BackedgeBlock = Backedge.Branch->getParent();
-
-  // This ensures we only insert one branch instruction (conditional) instead of two
-  assert((LoopUnrollASMForce || Backedge.Pattern != Multi_CondExit_Backedge ||
-          BackedgeBlock->isLayoutSuccessor(Backedge.ExitBlock)) &&
-         "ExitBlock must be the fallthrough successor of BackedgeBlock for correct unrolling");
 
   // Collect all non-terminator instructions to duplicate from all loop blocks
   // Use a map to maintain per-block instruction lists for multi-block loops
