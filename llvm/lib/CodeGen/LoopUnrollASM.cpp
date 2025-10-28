@@ -123,6 +123,7 @@ private:
                                     const MachineInstr *BranchInst,
                                     const TargetInstrInfo *TII);
   bool isPostIndexMemOp(const MachineInstr &MI);
+  bool isLoadStorePair(const MachineInstr &MI);
   static bool isLoopSimplifyForm(const MachineLoop *Loop);
   static void debugPrintLoopInfo(MachineFunction &MF, const MachineLoop *Loop,
                           StringRef Prefix, MachineBasicBlock *ExitBlock = nullptr);
@@ -385,6 +386,33 @@ bool LoopUnrollASM::isPostIndexMemOp(const MachineInstr &MI) {
   return isPostIndex;
 }
 
+/// Check if a memory operation is a load-pair or store-pair instruction.
+/// Load/store pair instructions operate on two registers and are counted with weight 2.
+/// Returns true if the instruction is a load-pair or store-pair operation.
+bool LoopUnrollASM::isLoadStorePair(const MachineInstr &MI) {
+  if (!MI.mayLoadOrStore() || MI.isTerminator())
+    return false;
+
+  // Get the opcode name to check for pair patterns
+  StringRef OpcodeName = TII->getName(MI.getOpcode());
+
+  // Common patterns for load/store pair instructions on AArch64
+  // LDP - Load Pair of Registers
+  // STP - Store Pair of Registers
+  // LDNP - Load Pair Non-temporal
+  // STNP - Store Pair Non-temporal
+  bool isPairOp = OpcodeName.starts_with("LDP") ||   // LDP variants (LDPWi, LDPXi, LDPSi, LDPDi, LDPQi, etc.)
+                  OpcodeName.starts_with("STP") ||   // STP variants (STPWi, STPXi, STPSi, STPDi, STPQi, etc.)
+                  OpcodeName.starts_with("LDNP") ||  // LDNP variants (LDNPWi, LDNPXi, LDNPSi, LDNPDi, LDNPQi, etc.)
+                  OpcodeName.starts_with("STNP");    // STNP variants (STNPWi, STNPXi, STNPSi, STNPDi, STNPQi, etc.)
+
+  if (isPairOp) {
+    LLVM_DEBUG(dbgs() << "    Observed load/store pair instruction: " << OpcodeName << "\n");
+  }
+
+  return isPairOp;
+}
+
 /// Check if a MachineLoop is in loop simplify form.
 /// A loop in simplify form has:
 /// - A preheader (single predecessor outside the loop)
@@ -454,6 +482,45 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       else if (isPostIndexMemOp(MI))
         // Post-index operations translate into 2 operations
         ++LoopCount;
+      if (isLoadStorePair(MI))
+        // Load/store pair instructions translate into 2 operations (orthogonal to Post-Index)
+        ++LoopCount;
+
+      // Check for WFE (Wait For Event) instruction
+      StringRef OpcodeName = TII->getName(MI.getOpcode());
+      if (OpcodeName == "WFE") {
+        // WFE instruction has additional overhead
+        ++LoopCount;
+        LLVM_DEBUG(dbgs() << "    Observed WFE instruction\n");
+      }
+      // Check for Pointer Authentication (AUT*) instructions
+      else if (OpcodeName.starts_with("AUT")) {
+        // Pointer Authentication instructions have additional overhead
+        ++LoopCount;
+        LLVM_DEBUG(dbgs() << "    Observed Pointer Authentication instruction: " << OpcodeName << "\n");
+      }
+      // Atomic instructions are multiple operations
+      // LDADD* variants (LDADD, LDADDA, LDADDAL, LDADDL, etc.)
+      // CAS* variants (CAS, CASA, CASAL, CASL, CASB, CASH, etc.)
+      else if (OpcodeName.starts_with("LDADD") || OpcodeName.starts_with("CAS")) {
+        LoopCount += 3;
+        LLVM_DEBUG(dbgs() << "    Observed atomic instruction: " << OpcodeName << "\n");
+      }
+      // Check for integer MADD (Multiply-Add) instructions
+      // MADD, MADDWrrr, MADDXrrr, SMADDL, UMADDL (but not FMADD for floating-point)
+      else if ((OpcodeName.starts_with("MADD") || OpcodeName.starts_with("SMADD") || OpcodeName.starts_with("UMADD"))
+          && !OpcodeName.starts_with("FMADD")) {
+        // Integer multiply-add has additional overhead
+        ++LoopCount;
+        LLVM_DEBUG(dbgs() << "    Observed integer MADD instruction: " << OpcodeName << "\n");
+      }
+      // Check for Synchronization Barrier instructions
+      // DMB (Data Memory Barrier), DSB (Data Synchronization Barrier), ISB (Instruction Synchronization Barrier)
+      else if (OpcodeName.starts_with("DMB") || OpcodeName.starts_with("DSB") || OpcodeName.starts_with("ISB")) {
+        // Synchronization barriers have very significant overhead (4 additional cycles)
+        LoopCount += 4;
+        LLVM_DEBUG(dbgs() << "    Observed synchronization barrier instruction: " << OpcodeName << "\n");
+      }
 
       // We want to exclude loops with any control flow changing instructions
       // (branches, calls, returns) except for the terminator
