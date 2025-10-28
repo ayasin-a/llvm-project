@@ -273,9 +273,9 @@ bool LoopUnrollASM::isCompareBranchFusion(const MachineInstr *CompareInst,
 
   // Pattern detection based on opcode names (AArch64-specific)
   // Case 1: Flag-producing comparison followed by conditional branch
-  // Comparisons: CMN, CMP, TEQ, TST, ADDS, SUBS, ANDS, BICS
+  // Comparisons: CMN, CMP, TEQ, TST, ADDS, SUBS, ANDS, BICS (excluding FCMP)
   bool isFlagProducingCompare =
-      CompareOpName.contains("CMP") ||   // CMP variants
+      (CompareOpName.contains("CMP") && !CompareOpName.contains("FCMP")) ||   // CMP variants (excluding FCMP)
       CompareOpName.contains("CMN") ||   // CMN variants
       CompareOpName.contains("TST") ||   // TST variants
       CompareOpName.contains("TEQ") ||   // TEQ variants
