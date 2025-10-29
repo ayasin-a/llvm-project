@@ -51,6 +51,7 @@ STATISTIC(NumInnerLoopsBranchIndirect, "Number of inner loops skipped (indirect 
 STATISTIC(NumInnerLoopsBranchConditionalNoBackedge, "Number of inner loops skipped (conditional branch without backedge)");
 STATISTIC(NumInnerLoopsHasAtomicOps, "Number of inner loops skipped (has atomic ops)");
 STATISTIC(NumInnerLoopsHasInternalBranch, "Number of inner loops skipped (has internal branch)");
+STATISTIC(NumInnerLoopsTooManyBlocks, "Number of inner loops skipped (too many blocks)");
 STATISTIC(NumInnerLoopsTooManyInsts, "Number of inner loops skipped (too many instructions)");
 STATISTIC(NumInnerLoopsBranchPrepFailure, "Number of loops skipped (branch analysis or condition inversion failed)");
 // dev stats
@@ -456,6 +457,13 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
   ++NumInnermostLoops;
 
+  // Skip loops with too many basic blocks
+  if (Loop->getNumBlocks() > 8) {
+    ++NumInnerLoopsTooManyBlocks;
+    LLVM_DEBUG(dbgs() << "  skipping: Too many blocks (" << Loop->getNumBlocks() << " > 8)\n");
+    return Changed;
+  }
+
   // Count instructions in the loop and check for internal branches
   // We want to skip loops that have branches within the loop body
   // (excluding the terminator back-edge branch)
@@ -488,13 +496,21 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 
       // Check for WFE (Wait For Event) instruction
       StringRef OpcodeName = TII->getName(MI.getOpcode());
+
+      // Lambda to check if OpcodeName starts with any of the given mnemonics
+      auto startsWithAny = [&OpcodeName](std::initializer_list<StringRef> mnemonics) {
+        return llvm::any_of(mnemonics, [&OpcodeName](StringRef mnemonic) {
+          return OpcodeName.starts_with(mnemonic);
+        });
+      };
+
       if (OpcodeName == "WFE") {
         // WFE instruction has additional overhead
         ++LoopCount;
         LLVM_DEBUG(dbgs() << "    Observed WFE instruction\n");
       }
       // Check for Pointer Authentication (AUT*) instructions
-      else if (OpcodeName.starts_with("AUT")) {
+      else if (startsWithAny({"AUT"})) {
         // Pointer Authentication instructions have additional overhead
         ++LoopCount;
         LLVM_DEBUG(dbgs() << "    Observed Pointer Authentication instruction: " << OpcodeName << "\n");
@@ -502,21 +518,20 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       // Atomic instructions are multiple operations
       // LDADD* variants (LDADD, LDADDA, LDADDAL, LDADDL, etc.)
       // CAS* variants (CAS, CASA, CASAL, CASL, CASB, CASH, etc.)
-      else if (OpcodeName.starts_with("LDADD") || OpcodeName.starts_with("CAS")) {
+      else if (startsWithAny({"LDADD", "CAS"})) {
         LoopCount += 3;
         LLVM_DEBUG(dbgs() << "    Observed atomic instruction: " << OpcodeName << "\n");
       }
       // Check for integer MADD (Multiply-Add) instructions
       // MADD, MADDWrrr, MADDXrrr, SMADDL, UMADDL (but not FMADD for floating-point)
-      else if ((OpcodeName.starts_with("MADD") || OpcodeName.starts_with("SMADD") || OpcodeName.starts_with("UMADD"))
-          && !OpcodeName.starts_with("FMADD")) {
+      else if (startsWithAny({"MADD", "SMADD", "UMADD"}) && !OpcodeName.starts_with("FMADD")) {
         // Integer multiply-add has additional overhead
         ++LoopCount;
         LLVM_DEBUG(dbgs() << "    Observed integer MADD instruction: " << OpcodeName << "\n");
       }
       // Check for Synchronization Barrier instructions
       // DMB (Data Memory Barrier), DSB (Data Synchronization Barrier), ISB (Instruction Synchronization Barrier)
-      else if (OpcodeName.starts_with("DMB") || OpcodeName.starts_with("DSB") || OpcodeName.starts_with("ISB")) {
+      else if (startsWithAny({"DMB", "DSB", "ISB"})) {
         // Synchronization barriers have very significant overhead (4 additional cycles)
         LoopCount += 4;
         LLVM_DEBUG(dbgs() << "    Observed synchronization barrier instruction: " << OpcodeName << "\n");
