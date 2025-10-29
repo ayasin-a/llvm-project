@@ -12,6 +12,7 @@
 #include "MCTargetDesc/AArch64AddressingModes.h"
 #include "Utils/AArch64SMEAttributes.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/CodeGen/BasicTTIImpl.h"
@@ -34,8 +35,13 @@ using namespace llvm::PatternMatch;
 
 #define DEBUG_TYPE "aarch64tti"
 
+STATISTIC(NumLoopsUnrolledForFetchBubbles, "Number of loops with unroll count set based on fetch bubbles");
+
 static cl::opt<bool> EnableFalkorHWPFUnrollFix("enable-falkor-hwpf-unroll-fix",
                                                cl::init(true), cl::Hidden);
+
+static cl::opt<float> UnrollForFetchBW("unroll-fetch-bubbles-threshold",
+                                       cl::init(0.0f), cl::Hidden);
 
 static cl::opt<bool> SVEPreferFixedOverScalableIfEqualCost(
     "sve-prefer-fixed-over-scalable-if-equal", cl::Hidden);
@@ -5027,20 +5033,66 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
 
     // Try to find an unroll count that maximizes the use of the instruction
     // window, i.e. trying to fetch as many instructions per cycle as possible.
-    unsigned MaxInstsPerLine = 16;
-    unsigned UC = 1;
     unsigned BestUC = 1;
-    unsigned SizeWithBestUC = BestUC * Size;
-    while (UC <= 8) {
-      unsigned SizeWithUC = UC * Size;
-      if (SizeWithUC > 48)
-        break;
-      if ((SizeWithUC % MaxInstsPerLine) == 0 ||
-          (SizeWithBestUC % MaxInstsPerLine) < (SizeWithUC % MaxInstsPerLine)) {
-        BestUC = UC;
-        SizeWithBestUC = BestUC * Size;
+    if (UnrollForFetchBW == 0.0f) {
+      unsigned MaxInstsPerLine = 16;
+      unsigned UC = 1;
+      unsigned SizeWithBestUC = BestUC * Size;
+      while (UC <= 8) {
+        unsigned SizeWithUC = UC * Size;
+        if (SizeWithUC > 48)
+          break;
+        if ((SizeWithUC % MaxInstsPerLine) == 0 ||
+            (SizeWithBestUC % MaxInstsPerLine) < (SizeWithUC % MaxInstsPerLine)) {
+          BestUC = UC;
+          SizeWithBestUC = BestUC * Size;
+        }
+        UC++;
       }
-      UC++;
+    } else {
+      // Determine BestUC differently based on fetch bubbles
+      const unsigned MachineWidth = 10;
+      assert(Width == MachineWidth);
+      auto calculateBubbles = [](unsigned LoopCount) -> unsigned {
+        unsigned Remainder = LoopCount % MachineWidth;
+        return Remainder ? MachineWidth - Remainder : 0;
+      };
+      auto findBestUnrollCount = [&calculateBubbles](unsigned LoopCount,
+                                                      unsigned Bubbles,
+                                                      unsigned MachineWidth) -> unsigned {
+        unsigned BestUC = 2; // Start with the default unroll factor of 2
+        unsigned UC = 2;
+
+        while (true) {
+          // Calculate the new loop count after unrolling
+          unsigned NewLoopCount = LoopCount * UC;
+
+          // Stop if the new loop count is too large
+          if (NewLoopCount > 12 * MachineWidth)
+            break;
+
+          // Calculate new bubbles for this unroll count
+          unsigned NewBubbles = calculateBubbles(NewLoopCount);
+          // Update best unroll count if we found fewer bubbles
+          if (NewBubbles < Bubbles) {
+            BestUC = UC;
+            Bubbles = NewBubbles; // Update Bubbles for comparison in next iteration
+          }
+
+          // Stop if we've eliminated all bubbles
+          if (NewBubbles == 0)
+            break;
+
+          ++UC;
+        }
+
+        return BestUC;
+      };
+      unsigned Bubbles = calculateBubbles(Size);
+      if (Bubbles / float(MachineWidth) > UnrollForFetchBW) {
+        BestUC = findBestUnrollCount(Size, Bubbles, MachineWidth);
+        ++NumLoopsUnrolledForFetchBubbles;
+      }
     }
 
     if (BestUC == 1)
