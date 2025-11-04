@@ -4974,12 +4974,16 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
   // likely with complex control flow). Note that the heuristics here may be
   // overly conservative and we err on the side of avoiding runtime unrolling
   // rather than unroll excessively. They are all subject to further refinement.
-  if (!L->isInnermost() || L->getNumBlocks() > 8)
+  if (!L->isInnermost() || L->getNumBlocks() > 8) {
+    LLVM_DEBUG(dbgs() << "  AppleUP: skip non-innermost or >8 blocks (innermost=" << L->isInnermost() << " blocks=" << L->getNumBlocks() << ")\n");
     return;
+  }
 
   // Loops with multiple exits are handled by common code.
-  if (!L->getExitBlock())
+  if (!L->getExitBlock()) {
+    LLVM_DEBUG(dbgs() << "  AppleUP: skip multiple exits\n");
     return;
+  }
 
   // Check if the loop contains any reductions that could be parallelized when
   // unrolling. If so, enable partial unrolling, if the trip count is know to be
@@ -5001,14 +5005,20 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
   const SCEV *BTC = SE.getSymbolicMaxBackedgeTakenCount(L);
   if (isa<SCEVConstant>(BTC) || isa<SCEVCouldNotCompute>(BTC) ||
       (SE.getSmallConstantMaxTripCount(L) > 0 &&
-       SE.getSmallConstantMaxTripCount(L) <= 32))
+       SE.getSmallConstantMaxTripCount(L) <= 32)) {
+    LLVM_DEBUG(dbgs() << "  AppleUP: skip const/unknown BTC or small trip count (maxTC=" << SE.getSmallConstantMaxTripCount(L) << ")\n");
     return;
+  }
 
-  if (findStringMetadataForLoop(L, "llvm.loop.isvectorized"))
+  if (findStringMetadataForLoop(L, "llvm.loop.isvectorized")) {
+    LLVM_DEBUG(dbgs() << "  AppleUP: skip already vectorized\n");
     return;
+  }
 
-  if (SE.getSymbolicMaxBackedgeTakenCount(L) != SE.getBackedgeTakenCount(L))
+  if (SE.getSymbolicMaxBackedgeTakenCount(L) != SE.getBackedgeTakenCount(L)) {
+    LLVM_DEBUG(dbgs() << "  AppleUP: skip symbolic max != BTC\n");
     return;
+  }
 
   // Limit to loops with trip counts that are cheap to expand.
   UP.SCEVExpansionBudget = 1;
@@ -5028,8 +5038,10 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
     // Estimate the size of the loop.
     unsigned Size;
     unsigned Width = 10;
-    if (!isLoopSizeWithinBudget(L, TTI, Width, &Size))
+    if (!isLoopSizeWithinBudget(L, TTI, Width, &Size)) {
+      LLVM_DEBUG(dbgs() << "  AppleUP: skip size exceeds budget (size=" << Size << " width=" << Width << ")\n");
       return;
+    }
 
     // Try to find an unroll count that maximizes the use of the instruction
     // window, i.e. trying to fetch as many instructions per cycle as possible.
@@ -5095,8 +5107,10 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
       }
     }
 
-    if (BestUC == 1)
+    if (BestUC == 1) {
+      LLVM_DEBUG(dbgs() << "  AppleUP: skip BestUC=1 (size=" << Size << ")\n");
       return;
+    }
 
     SmallPtrSet<Value *, 8> LoadedValuesPlus;
     SmallVector<StoreInst *> Stores;
@@ -5121,11 +5135,14 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
 
     if (none_of(Stores, [&LoadedValuesPlus](StoreInst *SI) {
           return LoadedValuesPlus.contains(SI->getOperand(0));
-        }))
+        })) {
+      LLVM_DEBUG(dbgs() << "  AppleUP: skip no load->store deps (stores=" << Stores.size() << " loads=" << LoadedValuesPlus.size() << ")\n");
       return;
+    }
 
     UP.Runtime = true;
     UP.DefaultUnrollRuntimeCount = BestUC;
+    LLVM_DEBUG(dbgs() << "  AppleUP: enable runtime unroll UC=" << BestUC << " (size=" << Size << ")\n");
     return;
   }
 
@@ -5135,8 +5152,10 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
   SmallVector<BasicBlock *> Preds(predecessors(Latch));
   if (!Term || !Term->isConditional() || Preds.size() == 1 ||
       !llvm::is_contained(Preds, Header) ||
-      none_of(Preds, [L](BasicBlock *Pred) { return L->contains(Pred); }))
+      none_of(Preds, [L](BasicBlock *Pred) { return L->contains(Pred); })) {
+    LLVM_DEBUG(dbgs() << "  AppleUP: skip no early-continue pattern (header!=latch)\n");
     return;
+  }
 
   std::function<bool(Instruction *, unsigned)> DependsOnLoopLoad =
       [&](Instruction *I, unsigned Depth) -> bool {
@@ -5157,6 +5176,7 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
                        m_Value())) &&
       DependsOnLoopLoad(I, 0)) {
     UP.Runtime = true;
+    LLVM_DEBUG(dbgs() << "  AppleUP: enable runtime unroll for early-continue with loop-varying load\n");
   }
 }
 
