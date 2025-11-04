@@ -1170,9 +1170,16 @@ tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI, ScalarEvolution &SE,
                 std::optional<unsigned> ProvidedFullUnrollMaxCount,
                 AAResults *AA = nullptr) {
 
-  LLVM_DEBUG(dbgs() << "Loop Unroll: F["
-                    << L->getHeader()->getParent()->getName() << "] Loop %"
-                    << L->getHeader()->getName() << " " << L->getStartLoc() << "\n");
+  LLVM_DEBUG({
+    dbgs() << "Loop Unroll: F["
+           << L->getHeader()->getParent()->getName() << "] Loop %"
+           << L->getHeader()->getName();
+    if (L->getStartLoc()) {
+      dbgs() << " Source=";
+      L->getStartLoc().print(dbgs());
+    }
+    dbgs() << "\n";
+  });
   TransformationMode TM = hasUnrollTransformation(L);
   if (TM & TM_Disable)
     return LoopUnrollResult::Unmodified;
