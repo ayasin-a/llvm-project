@@ -69,6 +69,12 @@ static cl::opt<float> LoopUnrollASMFetchBubblesThreshold(
     cl::desc("Threshold for fetch bubbles ratio to trigger loop unrolling"),
     cl::init(0.20f), cl::Hidden);
 
+static cl::opt<unsigned> LoopUnrollASMEnable(
+    "loop-unroll-asm-enable",
+    cl::desc("Bitmask to enable each pattern in LoopUnrollASM "
+             "(bit 0: One_Backedge, bit 1: Two_Backedge_Uncond, bit 2: Multi_CondExit_Backedge)"),
+    cl::init(0x3), cl::Hidden);
+
 namespace {
 enum TerminatorPattern {
   Nonsupported = 0,
@@ -148,6 +154,9 @@ INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
 INITIALIZE_PASS_END(LoopUnrollASM, DEBUG_TYPE, "Loop Unroll at Assembly Level", false, false)
 
 bool LoopUnrollASM::runOnMachineFunction(MachineFunction &MF) {
+  if (!LoopUnrollASMEnable)
+    return false;
+
   MachineLoopInfo &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
   TII = MF.getSubtarget().getInstrInfo();
 
@@ -604,7 +613,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     }
   }
   unsigned NumTerminators = Terminators.size();
-  TerminatorPattern Pattern = NumTerminators == 1 ? One_Backedge : Nonsupported;
+  TerminatorPattern Pattern = (NumTerminators == 1 && (LoopUnrollASMEnable & 0x1)) ? One_Backedge : Nonsupported;
 
   // Traverse the backedge branch's block backwards to determine if loop ends with
   // unconditional branch somewhere outside the loop.
@@ -656,8 +665,10 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
           FirstTermIter->isConditionalBranch() &&
           Last->isUnconditionalBranch()) {
         // Pattern 1: conditional branch followed by unconditional branch
-        Pattern = Two_Backedge_Uncond;
-        LLVM_DEBUG(dbgs() << "  Detected Two_Backedge_Uncond pattern\n");
+        if (LoopUnrollASMEnable & 0x2) {
+          Pattern = Two_Backedge_Uncond;
+          LLVM_DEBUG(dbgs() << "  Detected Two_Backedge_Uncond pattern\n");
+        }
         if (Last != lastUnconditionalExitBranch) {
           ++NumInnerLoops_InvalidUncondExit;
           LLVM_DEBUG(dbgs() << "    Last != lastUnconditionalExitBranc\n");
@@ -676,8 +687,10 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   if (NumTerminators > 1 && Pattern == Nonsupported) {
     // TODO: this may replace the more complex Latch based logic above
     if (Pattern == Nonsupported && lastUnconditionalExitBranch && NumTerminators == 2 && BackedgeBranch) {
-      Pattern = Two_Backedge_Uncond;
-      LLVM_DEBUG(dbgs() << "  Detected Two_Backedge_Uncond pattern; fixup\n");
+      if (LoopUnrollASMEnable & 0x2) {
+        Pattern = Two_Backedge_Uncond;
+        LLVM_DEBUG(dbgs() << "  Detected Two_Backedge_Uncond pattern; fixup\n");
+      }
     }
 
     // Check if all terminators except BackedgeBranch target the exit
@@ -690,7 +703,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
           break;
         }
       }
-      if (allOthersTargetExit) {
+      if (allOthersTargetExit && (LoopUnrollASMEnable & 0x4)) {
         Pattern = Multi_CondExit_Backedge;
         LLVM_DEBUG(dbgs() << "  Detected Multi_CondExit_Backedge pattern ("
                           << NumTerminators << " terminators: exit branches + backedge)\n");
