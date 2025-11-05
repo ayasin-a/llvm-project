@@ -1178,7 +1178,7 @@ tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI, ScalarEvolution &SE,
       dbgs() << " Source=";
       L->getStartLoc().print(dbgs());
     }
-    dbgs() << "\n";
+    dbgs() << " FullUnroll=" << int(OnlyFullUnroll) << "\n";
   });
   TransformationMode TM = hasUnrollTransformation(L);
   if (TM & TM_Disable)

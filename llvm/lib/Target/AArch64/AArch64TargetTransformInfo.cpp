@@ -5039,7 +5039,7 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
     unsigned Size;
     unsigned Width = 10;
     if (!isLoopSizeWithinBudget(L, TTI, Width, &Size)) {
-      LLVM_DEBUG(dbgs() << "  AppleUP: skip size exceeds budget=" << Width << "(size=" << Size << ")\n");
+      LLVM_DEBUG(dbgs() << "  AppleUP: skip size exceeds budget=" << Width << " (size=" << Size << ")\n");
       return;
     }
 
