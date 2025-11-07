@@ -77,6 +77,11 @@ static cl::opt<unsigned> LoopUnrollASMEnable(
              "(bit 0: One_Backedge, bit 1: Two_Backedge_Uncond, bit 2: Multi_CondExit_Backedge)"),
     cl::init(0x3), cl::Hidden);
 
+static cl::opt<unsigned> LoopUnrollASMMinBubbles(
+    "loop-unroll-asm-min-bubbles",
+    cl::desc("Minimum number of bubbles to continue searching for better unroll count"),
+    cl::init(3), cl::Hidden);
+
 namespace {
 enum TerminatorPattern {
   Nonsupported = 0,
@@ -957,8 +962,8 @@ unsigned LoopUnrollASM::findBestUnrollCount(unsigned LoopCount,
       Bubbles = NewBubbles; // Update Bubbles for comparison in next iteration
     }
 
-    // Stop if we've eliminated all bubbles
-    if (NewBubbles == 0)
+    // Stop if we've eliminated most bubbles
+    if (NewBubbles < LoopUnrollASMMinBubbles)
       break;
 
     ++UC;
