@@ -495,7 +495,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         continue;
 
       StringRef OpcodeName = TII->getName(MI.getOpcode());
-      if (OpcodeName == "FCSEL") {
+      if (OpcodeName.starts_with("FCSEL")) {
         ++NumInnerLoopsHasFcsel;
         LLVM_DEBUG(dbgs() << "  skipping: FCSEL instruction\n");
         return Changed;
