@@ -39,6 +39,7 @@ STATISTIC(NumLoopsUnrolled, "Number of tight loops unrolled by LoopUnrollASM");
 STATISTIC(NumLoopsUnrolledCondUncond, "Number of tight loops unrolled with cond+uncond terminators");
 STATISTIC(NumLoopsUnrolledMultiCondExit, "Number of tight loops unrolled with multi-cond-exit+backedge pattern");
 STATISTIC(NumLoopsNotEnoughBubbles, "Number of tight loops skipped (not enough bubbles)");
+STATISTIC(NumAddedInsts, "Number of added instruction by loop-unroll-asm pass");
 STATISTIC(NumInnermostLoops, "Number of inner-most loops");
 // skipped; inner denotes innermost.
 STATISTIC(NumInnerLoopsNotSingleBB, "Number of inner loops skipped (Header != Latch)");
@@ -50,6 +51,7 @@ STATISTIC(NumInnerLoopsBranchUnconditional, "Number of inner loops skipped (unco
 STATISTIC(NumInnerLoopsBranchIndirect, "Number of inner loops skipped (indirect branch)");
 STATISTIC(NumInnerLoopsBranchConditionalNoBackedge, "Number of inner loops skipped (conditional branch without backedge)");
 STATISTIC(NumInnerLoopsHasAtomicOps, "Number of inner loops skipped (has atomic ops)");
+STATISTIC(NumInnerLoopsHasFcsel, "Number of inner loops skipped (has FCSEL inst)");
 STATISTIC(NumInnerLoopsHasInternalBranch, "Number of inner loops skipped (has internal branch)");
 STATISTIC(NumInnerLoopsTooManyBlocks, "Number of inner loops skipped (too many blocks)");
 STATISTIC(NumInnerLoopsTooManyInsts, "Number of inner loops skipped (too many instructions)");
@@ -492,6 +494,13 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       if (MI.isDebugInstr() || MI.isPseudo())
         continue;
 
+      StringRef OpcodeName = TII->getName(MI.getOpcode());
+      if (OpcodeName == "FCSEL") {
+        ++NumInnerLoopsHasFcsel;
+        LLVM_DEBUG(dbgs() << "  skipping: FCSEL instruction\n");
+        return Changed;
+      }
+
       ++LoopCount;
       if (PrevInst && MI.isBranch() && isCompareBranchFusion(PrevInst, &MI, TII))
         // Compare-Branch pair get fused into one operation
@@ -503,9 +512,6 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         // Load/store pair instructions translate into 2 operations (orthogonal to Post-Index)
         ++LoopCount;
 
-      // Check for WFE (Wait For Event) instruction
-      StringRef OpcodeName = TII->getName(MI.getOpcode());
-
       // Lambda to check if OpcodeName starts with any of the given mnemonics
       auto startsWithAny = [&OpcodeName](std::initializer_list<StringRef> mnemonics) {
         return llvm::any_of(mnemonics, [&OpcodeName](StringRef mnemonic) {
@@ -513,6 +519,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         });
       };
 
+      // Check for WFE (Wait For Event) instruction
       if (OpcodeName == "WFE") {
         // WFE instruction has additional overhead
         ++LoopCount;
@@ -911,7 +918,9 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
 
     LLVM_DEBUG({debugPrintLoopInfo(MF, Loop, "Found qualifying", Backedge.ExitBlock);
       dbgs() << "  with Loop count: " << LoopCount << "\n";});
-    duplicateLoopBody(Loop, findBestUnrollCount(LoopCount, Bubbles, MachineWidth), Backedge);
+    unsigned UC = findBestUnrollCount(LoopCount, Bubbles, MachineWidth);
+    duplicateLoopBody(Loop, UC, Backedge);
+    NumAddedInsts += (UC - 1) * LoopCount;
     ++NumLoopsUnrolled;
     if (Backedge.Pattern == Two_Backedge_Uncond) {
       ++NumLoopsUnrolledCondUncond;
