@@ -53,6 +53,7 @@ STATISTIC(NumInnerLoopsBranchConditionalNoBackedge, "Number of inner loops skipp
 STATISTIC(NumInnerLoopsHasAtomicOps, "Number of inner loops skipped (has atomic ops)");
 STATISTIC(NumInnerLoopsHasFcsel, "Number of inner loops skipped (has FCSEL inst)");
 STATISTIC(NumInnerLoopsHasInternalBranch, "Number of inner loops skipped (has internal branch)");
+STATISTIC(NumInnerLoopsHasMadd, "Number of inner loops skipped (has MADD inst)");
 STATISTIC(NumInnerLoopsTooManyBlocks, "Number of inner loops skipped (too many blocks)");
 STATISTIC(NumInnerLoopsTooManyInsts, "Number of inner loops skipped (too many instructions)");
 STATISTIC(NumInnerLoopsBranchPrepFailure, "Number of loops skipped (branch analysis or condition inversion failed)");
@@ -549,6 +550,11 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         // Integer multiply-add has additional overhead
         ++LoopCount;
         LLVM_DEBUG(dbgs() << "    Observed integer MADD instruction: " << OpcodeName << "\n");
+        if (OpcodeName.starts_with("MADD")) {
+          ++NumInnerLoopsHasMadd;
+          LLVM_DEBUG(dbgs() << "  skipping: MADD instruction\n");
+          return Changed;
+        }
       }
       // Check for Synchronization Barrier instructions
       // DMB (Data Memory Barrier), DSB (Data Synchronization Barrier), ISB (Instruction Synchronization Barrier)
