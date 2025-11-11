@@ -16,17 +16,22 @@
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstr.h"
+#include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DebugLoc.h"
+#include "llvm/IR/Function.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/Alignment.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/TargetMachine.h"
 #include <cassert>
 
 using namespace llvm;
@@ -61,6 +66,10 @@ STATISTIC(NumInnerLoopsBranchPrepFailure, "Number of loops skipped (branch analy
 STATISTIC(NumInnerLoops_BackedgeFallthruHeader, "Number of inner loops where Backedge branch fallsthrough into Loop Header");
 STATISTIC(NumInnerLoops_InvalidUncondExit, "Number of inner loops ending with weird unconditional exit branch");
 STATISTIC(NumInnerLoops_LastInstNotBranch, "Number of inner loops where last instruction is not a branch");
+// uarch pass
+STATISTIC(NumUarchFCMPFCSELCrossCacheline, "Number of FCMP+FCSEL sequences that cross cacheline boundaries");
+STATISTIC(NumUarchMBBsSkippedNotInnermost, "Number of MBBs skipped (not in innermost loop)");
+STATISTIC(NumUarchNOPsInserted, "Number of NOPs inserted for FCMP+FCSEL cacheline crossings");
 
 static cl::opt<unsigned> LoopUnrollASMMaxInsts(
     "loop-unroll-asm-max-insts",
@@ -82,6 +91,16 @@ static cl::opt<unsigned> LoopUnrollASMMinBubbles(
     "loop-unroll-asm-min-bubbles",
     cl::desc("Minimum number of bubbles to continue searching for better unroll count"),
     cl::init(3), cl::Hidden);
+
+static cl::opt<bool> LoopUnrollASMUarch(
+    "loop-unroll-asm-uarch",
+    cl::desc("Enable microarchitecture-specific analysis"),
+    cl::init(true), cl::Hidden);
+
+static cl::opt<bool> LoopUnrollASMUarchAll(
+    "loop-unroll-asm-uarch-all",
+    cl::desc("Analyze all basic blocks for uarch issues (not just innermost loops)"),
+    cl::init(true), cl::Hidden);
 
 namespace {
 enum TerminatorPattern {
@@ -126,6 +145,7 @@ public:
 
 private:
   const TargetInstrInfo *TII = nullptr;
+  const MachineLoopInfo *MLI = nullptr;
 
   // Static helper function to calculate bubbles
   static unsigned calculateBubbles(unsigned LoopCount) {
@@ -134,9 +154,8 @@ private:
     return Remainder ? MachineWidth - Remainder : 0;
   }
 
-  static bool isCompareBranchFusion(const MachineInstr *CompareInst,
-                                    const MachineInstr *BranchInst,
-                                    const TargetInstrInfo *TII);
+  bool isCompareBranchFusion(const MachineInstr *CompareInst,
+                             const MachineInstr *BranchInst);
   bool isPostIndexMemOp(const MachineInstr &MI);
   bool isLoadStorePair(const MachineInstr &MI);
   static bool isLoopSimplifyForm(const MachineLoop *Loop);
@@ -151,6 +170,7 @@ private:
                                unsigned MachineWidth);
   void duplicateLoopBody(MachineLoop *Loop, unsigned UnrollFactor,
                          const BackedgeInfo &Backedge);
+  bool analyzeMachineInsts(MachineFunction &MF);
 };
 } // end anonymous namespace
 
@@ -162,20 +182,25 @@ INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
 INITIALIZE_PASS_END(LoopUnrollASM, DEBUG_TYPE, "Loop Unroll at Assembly Level", false, false)
 
 bool LoopUnrollASM::runOnMachineFunction(MachineFunction &MF) {
-  if (!LoopUnrollASMEnable)
-    return false;
-
-  MachineLoopInfo &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
   TII = MF.getSubtarget().getInstrInfo();
-
-  if (MLI.empty())
-    return false;
+  MLI = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
 
   bool Changed = false;
 
-  // Process all loops, starting with innermost ones
-  for (MachineLoop *Loop : MLI) {
-    Changed |= processLoop(Loop, MF);
+  // Process loops if enabled
+  if (LoopUnrollASMEnable) {
+
+    if (!MLI->empty()) {
+      // Process all loops, starting with innermost ones
+      for (MachineLoop *Loop : *MLI) {
+        Changed |= processLoop(Loop, MF);
+      }
+    }
+  }
+
+  // Analyze FCMP+FCSEL sequences across cacheline boundaries if enabled
+  if (LoopUnrollASMUarch) {
+    Changed |= analyzeMachineInsts(MF);
   }
 
   return Changed;
@@ -267,9 +292,8 @@ MachineInstr* LoopUnrollASM::findLoopBackedgeBranch(const MachineLoop* Loop) {
 /// according to ARM CPU architecture specifications.
 /// Returns true if fusion can occur, false otherwise.
 bool LoopUnrollASM::isCompareBranchFusion(const MachineInstr *CompareInst,
-                                          const MachineInstr *BranchInst,
-                                          const TargetInstrInfo *TII) {
-  if (!CompareInst || !BranchInst || !TII)
+                                          const MachineInstr *BranchInst) {
+  if (!CompareInst || !BranchInst)
     return false;
 
   // Branch must immediately follow the compare instruction
@@ -508,7 +532,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       }
 
       ++LoopCount;
-      if (PrevInst && MI.isBranch() && isCompareBranchFusion(PrevInst, &MI, TII))
+      if (PrevInst && MI.isBranch() && isCompareBranchFusion(PrevInst, &MI))
         // Compare-Branch pair get fused into one operation
         --LoopCount;
       else if (isPostIndexMemOp(MI))
@@ -1223,6 +1247,146 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
 
     assert(false && "Instruction count mismatch after loop unrolling");
   }
+}
+
+bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
+  // Get function alignment information from MachineFunction (actual assembly-level alignment)
+  const Function &F = MF.getFunction();
+  Align FuncAlign = MF.getAlignment();
+  unsigned AlignmentValue = FuncAlign.value();
+
+  // Early exit if function alignment < 2
+  if (AlignmentValue < 2) {
+    LLVM_DEBUG(dbgs() << "Skipping function " << F.getName()
+                      << " - alignment < 2 (actual: " << AlignmentValue << ")\n");
+    return false;
+  }
+
+  // Assert that we have a valid alignment
+  assert(AlignmentValue >= 2 && AlignmentValue <= 64 &&
+         "Function alignment must be between 2 and 64 bytes");
+  assert(isPowerOf2_32(AlignmentValue) &&
+         "Function alignment must be a power of 2");
+
+  LLVM_DEBUG(dbgs() << "Analyzing function " << F.getName()
+                    << " with alignment: " << AlignmentValue << " bytes\n");
+
+  // Without the actual address, we can only know possible offsets from 64-byte boundary
+  // For example, if function is 16-byte aligned, it could start at offsets: 0, 16, 32, 48
+  // relative to a 64-byte boundary
+
+  // For analysis purposes, we'll check all possible offsets
+  // But for FCMP/FCSEL analysis, what matters is relative offset within function
+
+  // Single pass: compute offsets and detect FCMP+FCSEL sequences
+  unsigned CurrentOffset = 0;
+  MachineInstr* PrevInstr = nullptr;
+  MachineBasicBlock* PrevMBB = nullptr;
+  MachineBasicBlock::iterator PrevIt;
+  unsigned PrevOffset = 0;
+  StringRef PrevOpcodeName;
+  MachineBasicBlock* PrevIteratedMBB = nullptr; // Track previous MBB in iteration order
+  bool MadeChanges = false; // Track if any NOPs were inserted
+
+  for (MachineBasicBlock &MBB : MF) {
+    // Skip blocks that are not in innermost loops if LoopUnrollASMUarchAll is off
+    if (!LoopUnrollASMUarchAll) {
+      assert(0 && "LoopUnrollASMUarchAll=0 misses Offset adjustment!");
+      MachineLoop *Loop = MLI->getLoopFor(&MBB);
+      if (!Loop || !Loop->getSubLoops().empty()) {
+        // Skip if not in a loop or not in an innermost loop
+        LLVM_DEBUG(dbgs() << "Skipping MBB " << MBB.getName()
+                         << " - not in innermost loop\n");
+        ++NumUarchMBBsSkippedNotInnermost;
+        PrevIteratedMBB = &MBB; // Update previous MBB even when skipping
+        continue;
+      }
+    }
+
+    // Track if we found any FCMP+FCSEL crossing in this MBB
+    bool FoundCrossingInMBB = false;
+
+    for (auto I = MBB.begin(), E = MBB.end(); I != E; ++I) {
+      MachineInstr &MI = *I;
+
+      // Skip debug instructions and pseudo instructions
+      if (MI.isDebugInstr() || MI.isPseudo())
+        continue;
+
+      StringRef OpcodeName = TII->getName(MI.getOpcode());
+
+      // Check if previous instruction was FCMP and current is FCSEL
+      // Only check within the same MBB
+      if (PrevInstr && PrevMBB == &MBB && PrevOpcodeName.starts_with("FCMP") && OpcodeName.starts_with("FCSEL")) {
+        // Found FCMP+FCSEL sequence, check if they would cross cachelines
+        // for all possible function start offsets
+        for (unsigned FuncStartOffset = 0; FuncStartOffset < 64; FuncStartOffset += AlignmentValue) {
+          // Calculate actual offsets including function start offset
+          unsigned FCMPActualOffset = PrevOffset + FuncStartOffset;
+          unsigned FCSELActualOffset = CurrentOffset + FuncStartOffset;
+
+          // Check if FCMP and FCSEL cross cacheline boundaries (cacheline is offset / 16)
+          if ((FCMPActualOffset / 16) != (FCSELActualOffset / 16)) {
+            // Mark that we found a crossing in this MBB
+            FoundCrossingInMBB = true;
+            ++NumUarchFCMPFCSELCrossCacheline;
+            break; // No need to check other offsets
+          }
+        }
+      } // for MachineInstr
+
+      // Update previous instruction info for next iteration
+      PrevInstr = &MI;
+      PrevMBB = &MBB;
+      PrevIt = I;
+      PrevOffset = CurrentOffset;
+      PrevOpcodeName = OpcodeName;
+
+      CurrentOffset += 4; // Assume 4-byte instructions for AArch64
+    }
+
+    // If we found any FCMP+FCSEL crossing in this MBB, insert NOP at end of previous MBB
+    if (FoundCrossingInMBB) {
+      MachineBasicBlock *TargetMBB = nullptr;
+      std::string InsertLocation;
+
+      // Always insert at the end of the previous MBB in layout order
+      if (PrevIteratedMBB) {
+        // Insert NOP at the end of the previous MBB, before any terminators
+        TargetMBB = PrevIteratedMBB;
+        InsertLocation = "at end of previous MBB " + PrevIteratedMBB->getName().str() + " (before terminators)";
+      } else {
+        // No previous MBB, insert at the start of the function (start of first MBB)
+        TargetMBB = &*MF.begin();
+        InsertLocation = "at start of function (beginning of first MBB)";
+      }
+
+      // Insert the NOP
+      if (TargetMBB) {
+        auto InsertPos = (TargetMBB == PrevIteratedMBB) ? TargetMBB->getFirstTerminator() : TargetMBB->begin();
+        TII->insertNoop(*TargetMBB, InsertPos);
+        // TODO: > remove function name in debug print 1368. Instead, if the MBB belongs to a loop, print its info invoking debugPrintLoopInfo. 
+        LLVM_DEBUG(dbgs() << "Inserting NOP in function " << F.getName()
+                        << " " << InsertLocation << "\n");
+        ++NumUarchNOPsInserted;
+        ++NumAddedInsts;
+        MadeChanges = true;
+
+        // Adjust CurrentOffset if the NOP affects the current offset calculation
+        // This happens if we inserted the NOP in a previous MBB that we've already processed
+        // or if we inserted it at the beginning of the current function
+        if (TargetMBB == &*MF.begin() ||
+            (PrevIteratedMBB && TargetMBB == PrevIteratedMBB)) {
+          CurrentOffset += 4; // Account for the inserted NOP
+        }
+      }
+    }
+
+    // Update previous MBB for next iteration
+    PrevIteratedMBB = &MBB;
+  }
+
+  return MadeChanges;
 }
 
 FunctionPass *llvm::createLoopUnrollASMPass() {
