@@ -56,7 +56,6 @@ STATISTIC(NumInnerLoopsBranchUnconditional, "Number of inner loops skipped (unco
 STATISTIC(NumInnerLoopsBranchIndirect, "Number of inner loops skipped (indirect branch)");
 STATISTIC(NumInnerLoopsBranchConditionalNoBackedge, "Number of inner loops skipped (conditional branch without backedge)");
 STATISTIC(NumInnerLoopsHasAtomicOps, "Number of inner loops skipped (has atomic ops)");
-STATISTIC(NumInnerLoopsHasFcsel, "Number of inner loops skipped (has FCSEL inst)");
 STATISTIC(NumInnerLoopsHasInternalBranch, "Number of inner loops skipped (has internal branch)");
 STATISTIC(NumInnerLoopsHasMadd, "Number of inner loops skipped (has MADD inst)");
 STATISTIC(NumInnerLoopsTooManyBlocks, "Number of inner loops skipped (too many blocks)");
@@ -64,6 +63,7 @@ STATISTIC(NumInnerLoopsTooManyInsts, "Number of inner loops skipped (too many in
 STATISTIC(NumInnerLoopsBranchPrepFailure, "Number of loops skipped (branch analysis or condition inversion failed)");
 // dev stats
 STATISTIC(NumInnerLoops_BackedgeFallthruHeader, "Number of inner loops where Backedge branch fallsthrough into Loop Header");
+STATISTIC(NumInnerLoops_HasFcsel, "Number of inner loops with FCSEL inst");
 STATISTIC(NumInnerLoops_InvalidUncondExit, "Number of inner loops ending with weird unconditional exit branch");
 STATISTIC(NumInnerLoops_LastInstNotBranch, "Number of inner loops where last instruction is not a branch");
 // uarch pass
@@ -526,9 +526,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 
       StringRef OpcodeName = TII->getName(MI.getOpcode());
       if (OpcodeName.starts_with("FCSEL")) {
-        ++NumInnerLoopsHasFcsel;
-        LLVM_DEBUG(dbgs() << "  skipping: FCSEL instruction\n");
-        return Changed;
+        ++NumInnerLoops_HasFcsel;
       }
 
       ++LoopCount;
