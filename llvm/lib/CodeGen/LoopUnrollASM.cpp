@@ -33,6 +33,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include <cassert>
+#include <set>
 
 using namespace llvm;
 
@@ -67,7 +68,6 @@ STATISTIC(NumInnerLoops_HasFcsel, "Number of inner loops with FCSEL inst");
 STATISTIC(NumInnerLoops_InvalidUncondExit, "Number of inner loops ending with weird unconditional exit branch");
 STATISTIC(NumInnerLoops_LastInstNotBranch, "Number of inner loops where last instruction is not a branch");
 // uarch pass
-STATISTIC(NumUarchFCMPFCSELCrossCacheline, "Number of FCMP+FCSEL sequences that cross cacheline boundaries");
 STATISTIC(NumUarchMBBsSkippedNotInnermost, "Number of MBBs skipped (not in innermost loop)");
 STATISTIC(NumUarchNOPsInserted, "Number of NOPs inserted for FCMP+FCSEL cacheline crossings");
 
@@ -527,6 +527,11 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       StringRef OpcodeName = TII->getName(MI.getOpcode());
       if (OpcodeName.starts_with("FCSEL")) {
         ++NumInnerLoops_HasFcsel;
+        if (1){//PrevInst && TII->getName(PrevInst->getOpcode()).starts_with("FCMP")) {
+          --LoopCount;
+          LLVM_DEBUG(dbgs() << "    skipping: FCMP-FCSEL pair\n");
+          return Changed;
+        }
       }
 
       ++LoopCount;
@@ -1253,21 +1258,24 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
   Align FuncAlign = MF.getAlignment();
   unsigned AlignmentValue = FuncAlign.value();
 
-  // Early exit if function alignment < 2
-  if (AlignmentValue < 2) {
-    LLVM_DEBUG(dbgs() << "Skipping function " << F.getName()
-                      << " - alignment < 2 (actual: " << AlignmentValue << ")\n");
+  // Also check the IR Function alignment; Use the larger
+  MaybeAlign IRAlign = F.getAlign();
+  unsigned IRAlignmentValue = IRAlign ? IRAlign->value() : 1;
+  AlignmentValue = std::max(AlignmentValue, IRAlignmentValue);
+
+  // Early exit if function alignment <= 4
+  if (AlignmentValue <= 4)
     return false;
-  }
 
   // Assert that we have a valid alignment
-  assert(AlignmentValue >= 2 && AlignmentValue <= 64 &&
-         "Function alignment must be between 2 and 64 bytes");
+  assert(AlignmentValue > 4 && AlignmentValue <= 64 &&
+         "Function alignment must be between 8 and 64 bytes (powers of 2)");
   assert(isPowerOf2_32(AlignmentValue) &&
          "Function alignment must be a power of 2");
 
   LLVM_DEBUG(dbgs() << "Analyzing function " << F.getName()
-                    << " with alignment: " << AlignmentValue << " bytes\n");
+                    << " with alignment: " << AlignmentValue << " bytes"
+                    << ", IR alignment: " << IRAlignmentValue << "\n");
 
   // Without the actual address, we can only know possible offsets from 64-byte boundary
   // For example, if function is 16-byte aligned, it could start at offsets: 0, 16, 32, 48
@@ -1276,113 +1284,122 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
   // For analysis purposes, we'll check all possible offsets
   // But for FCMP/FCSEL analysis, what matters is relative offset within function
 
-  // Single pass: compute offsets and detect FCMP+FCSEL sequences
-  unsigned CurrentOffset = 0;
-  MachineInstr* PrevInstr = nullptr;
-  MachineBasicBlock* PrevMBB = nullptr;
-  MachineBasicBlock::iterator PrevIt;
-  unsigned PrevOffset = 0;
-  StringRef PrevOpcodeName;
-  MachineBasicBlock* PrevIteratedMBB = nullptr; // Track previous MBB in iteration order
+  // Restructured: FuncStartOffset as outer loop to properly track NOPs across MBBs
+  // This ensures that NOPs inserted for one FuncStartOffset are accounted for in subsequent calculations
   bool MadeChanges = false; // Track if any NOPs were inserted
+  std::set<MachineBasicBlock*> NOPInsertedMBBs; // Track which MBBs have had NOPs inserted to avoid duplicates
 
-  for (MachineBasicBlock &MBB : MF) {
-    // Skip blocks that are not in innermost loops if LoopUnrollASMUarchAll is off
-    if (!LoopUnrollASMUarchAll) {
-      assert(0 && "LoopUnrollASMUarchAll=0 misses Offset adjustment!");
-      MachineLoop *Loop = MLI->getLoopFor(&MBB);
-      if (!Loop || !Loop->getSubLoops().empty()) {
-        // Skip if not in a loop or not in an innermost loop
-        LLVM_DEBUG(dbgs() << "Skipping MBB " << MBB.getName()
-                         << " - not in innermost loop\n");
-        ++NumUarchMBBsSkippedNotInnermost;
-        PrevIteratedMBB = &MBB; // Update previous MBB even when skipping
-        continue;
+  for (unsigned FuncStartOffset = 0; FuncStartOffset < 64; FuncStartOffset += AlignmentValue) {
+    // Reset state for each FuncStartOffset iteration
+    unsigned CurrentOffset = 0;
+    MachineInstr* PrevInstr = nullptr;
+    MachineBasicBlock* PrevMBB = nullptr;
+    MachineBasicBlock::iterator PrevIt;
+    unsigned PrevOffset = 0;
+    StringRef PrevOpcodeName;
+    MachineBasicBlock* PrevIteratedMBB = nullptr; // Track previous MBB in iteration order
+
+    for (MachineBasicBlock &MBB : MF) {
+      // Skip blocks that are not in innermost loops if LoopUnrollASMUarchAll is off
+      if (!LoopUnrollASMUarchAll) {
+        assert(0 && "LoopUnrollASMUarchAll=0 misses Offset adjustment!");
+        MachineLoop *Loop = MLI->getLoopFor(&MBB);
+        if (!Loop || !Loop->getSubLoops().empty()) {
+          // Skip if not in a loop or not in an innermost loop
+          LLVM_DEBUG(dbgs() << "Skipping MBB " << MBB.getName()
+                           << " - not in innermost loop\n");
+          ++NumUarchMBBsSkippedNotInnermost;
+          PrevIteratedMBB = &MBB; // Update previous MBB even when skipping
+          continue;
+        }
       }
-    }
 
-    // Track if we found any FCMP+FCSEL crossing in this MBB
-    bool FoundCrossingInMBB = false;
+      // Account for NOPs that were inserted in previous MBBs during previous FuncStartOffset iterations
+      if (PrevIteratedMBB && NOPInsertedMBBs.count(PrevIteratedMBB)) {
+        CurrentOffset += 1; // Adjust for the NOP that was inserted
+      }
 
-    for (auto I = MBB.begin(), E = MBB.end(); I != E; ++I) {
-      MachineInstr &MI = *I;
+      for (auto I = MBB.begin(), E = MBB.end(); I != E; ++I) {
+        MachineInstr &MI = *I;
 
-      // Skip debug instructions and pseudo instructions
-      if (MI.isDebugInstr() || MI.isPseudo())
-        continue;
+        // Skip debug instructions and pseudo instructions
+        if (MI.isDebugInstr() || MI.isPseudo())
+          continue;
 
-      StringRef OpcodeName = TII->getName(MI.getOpcode());
+        StringRef OpcodeName = TII->getName(MI.getOpcode());
 
-      // Check if previous instruction was FCMP and current is FCSEL
-      // Only check within the same MBB
-      if (PrevInstr && PrevMBB == &MBB && PrevOpcodeName.starts_with("FCMP") && OpcodeName.starts_with("FCSEL")) {
-        // Found FCMP+FCSEL sequence, check if they would cross cachelines
-        // for all possible function start offsets
-        for (unsigned FuncStartOffset = 0; FuncStartOffset < 64; FuncStartOffset += AlignmentValue) {
+        // Check if previous instruction was FCMP and current is FCSEL
+        // Only check within the same MBB
+        if (PrevInstr && PrevMBB == &MBB && PrevOpcodeName.starts_with("FCMP") && OpcodeName.starts_with("FCSEL")
+            && (PrevOffset % 2) == 1) {
+          LLVM_DEBUG(dbgs() << "    FCMP at odd offset: PrevOffset=" << PrevOffset << " CurrentOffset=" << CurrentOffset << "\n");
           // Calculate actual offsets including function start offset
-          unsigned FCMPActualOffset = PrevOffset + FuncStartOffset;
-          unsigned FCSELActualOffset = CurrentOffset + FuncStartOffset;
+          unsigned FCMPActualOffset = PrevOffset * 4 + FuncStartOffset;
+          unsigned FCSELActualOffset = CurrentOffset * 4 + FuncStartOffset;
 
           // Check if FCMP and FCSEL cross cacheline boundaries (cacheline is offset / 16)
           if ((FCMPActualOffset / 16) != (FCSELActualOffset / 16)) {
-            // Mark that we found a crossing in this MBB
-            FoundCrossingInMBB = true;
-            ++NumUarchFCMPFCSELCrossCacheline;
-            break; // No need to check other offsets
+            LLVM_DEBUG({
+              dbgs() << "    FuncStartOffset=" << FuncStartOffset << " CurrentOffset=" << CurrentOffset << " FoundCrossing=1 BB=" << MBB.getNumber() << "\n";
+              dbgs() << "    " << MI << "\n";
+              // Find the next real (non-debug, non-pseudo) instruction
+              auto NextI = std::next(I);
+              while (NextI != E && (NextI->isDebugInstr() || NextI->isPseudo())) {
+                ++NextI;
+              }
+              if (NextI != E) {
+                dbgs() << "    " << *NextI << "\n";
+              }
+            });
+
+            // Insert NOP immediately and adjust CurrentOffset for this FuncStartOffset
+            MachineBasicBlock *TargetMBB = nullptr;
+            std::string InsertLocation;
+
+            // Always insert at the end of the previous MBB in layout order
+            if (PrevIteratedMBB) {
+              TargetMBB = PrevIteratedMBB;
+              InsertLocation = "at end of previous MBB " + PrevIteratedMBB->getName().str() + " (before terminators)";
+            } else {
+              // No previous MBB, insert at the start of the function (start of first MBB)
+              TargetMBB = &*MF.begin();
+              InsertLocation = "at start of function (beginning of first MBB)";
+            }
+
+            // Insert the NOP (avoid duplicates using the set)
+            if (TargetMBB && NOPInsertedMBBs.find(TargetMBB) == NOPInsertedMBBs.end()) {
+              auto InsertPos = (TargetMBB == PrevIteratedMBB) ? TargetMBB->getFirstTerminator() : TargetMBB->begin();
+              TII->insertNoop(*TargetMBB, InsertPos);
+              // TODO: > remove function name in debug print. Instead, if the MBB belongs to a loop, print its info invoking debugPrintLoopInfo.
+              LLVM_DEBUG(dbgs() << "  Inserting NOP in function " << F.getName()
+                              << " " << InsertLocation << "\n");
+              ++NumUarchNOPsInserted;
+              ++NumAddedInsts;
+              MadeChanges = true;
+              NOPInsertedMBBs.insert(TargetMBB); // Mark this MBB as having a NOP inserted
+            }
+
+            // Adjust CurrentOffset since NOP affects subsequent calculations in this FuncStartOffset iteration
+            CurrentOffset += 1; // Account for the inserted NOP
+
+            // Continue to check for more crossings in this FuncStartOffset iteration
           }
         }
+
+        // Update previous instruction info for next iteration
+        PrevInstr = &MI;
+        PrevMBB = &MBB;
+        PrevIt = I;
+        PrevOffset = CurrentOffset;
+        PrevOpcodeName = OpcodeName;
+
+        CurrentOffset += 1; // Increment by 1 instruction (multiply by 4 for byte offset when needed)
       } // for MachineInstr
 
-      // Update previous instruction info for next iteration
-      PrevInstr = &MI;
-      PrevMBB = &MBB;
-      PrevIt = I;
-      PrevOffset = CurrentOffset;
-      PrevOpcodeName = OpcodeName;
-
-      CurrentOffset += 4; // Assume 4-byte instructions for AArch64
-    }
-
-    // If we found any FCMP+FCSEL crossing in this MBB, insert NOP at end of previous MBB
-    if (FoundCrossingInMBB) {
-      MachineBasicBlock *TargetMBB = nullptr;
-      std::string InsertLocation;
-
-      // Always insert at the end of the previous MBB in layout order
-      if (PrevIteratedMBB) {
-        // Insert NOP at the end of the previous MBB, before any terminators
-        TargetMBB = PrevIteratedMBB;
-        InsertLocation = "at end of previous MBB " + PrevIteratedMBB->getName().str() + " (before terminators)";
-      } else {
-        // No previous MBB, insert at the start of the function (start of first MBB)
-        TargetMBB = &*MF.begin();
-        InsertLocation = "at start of function (beginning of first MBB)";
-      }
-
-      // Insert the NOP
-      if (TargetMBB) {
-        auto InsertPos = (TargetMBB == PrevIteratedMBB) ? TargetMBB->getFirstTerminator() : TargetMBB->begin();
-        TII->insertNoop(*TargetMBB, InsertPos);
-        // TODO: > remove function name in debug print 1368. Instead, if the MBB belongs to a loop, print its info invoking debugPrintLoopInfo. 
-        LLVM_DEBUG(dbgs() << "Inserting NOP in function " << F.getName()
-                        << " " << InsertLocation << "\n");
-        ++NumUarchNOPsInserted;
-        ++NumAddedInsts;
-        MadeChanges = true;
-
-        // Adjust CurrentOffset if the NOP affects the current offset calculation
-        // This happens if we inserted the NOP in a previous MBB that we've already processed
-        // or if we inserted it at the beginning of the current function
-        if (TargetMBB == &*MF.begin() ||
-            (PrevIteratedMBB && TargetMBB == PrevIteratedMBB)) {
-          CurrentOffset += 4; // Account for the inserted NOP
-        }
-      }
-    }
-
-    // Update previous MBB for next iteration
-    PrevIteratedMBB = &MBB;
-  }
+      // Update previous MBB for next iteration
+      PrevIteratedMBB = &MBB;
+    } // for MachineBasicBlock
+  } // for FuncStartOffset
 
   return MadeChanges;
 }
