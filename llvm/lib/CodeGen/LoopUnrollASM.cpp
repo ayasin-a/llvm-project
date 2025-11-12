@@ -43,20 +43,17 @@ static cl::opt<unsigned> LoopUnrollASMDebug(
     cl::desc("Debug level for loop unroll asm pass"),
     cl::init(2), cl::Hidden);
 
-// Helper function to count leading whitespaces in a string
-static unsigned countLeadingSpaces(const char* str) {
-  unsigned count = 0;
-  while (str[count] == ' ') count++;
-  return count;
-}
-
 // **Debug Level Hierarchy**:
 //    - Level 0: Warning messages (always shown, e.g., "Warning: No backedge blocks found")
-//    - Level 1: Basic function-level information (e.g., "Analyzing function: X")
-//    - Level 2: Standard debug output with indentation (e.g., "  skipping: Too many blocks")
-//    - Level 4: Detailed analysis (instruction observations, fusion detection, etc.)
-//    - Level 5: Per-instruction analysis (FuncStartOffset, InstOffset, BB number, instruction)
-//
+//    - Level 1: Per-function high-level (e.g., "Analyzing function: X")
+//    - Level 2: Per-function low-level (detailed function information)
+//    - Level 3: Per-loop high-level (e.g., "Examining loop", "Found qualifying loop")
+//    - Level 4: Per-loop low-level (e.g., "findBestUnrollCount", loop skipping reasons)
+//    - Level 5: Per-BB high-level (e.g., basic block processing, branch patterns)
+//    - Level 6: Per-BB low-level (e.g., detailed BB analysis, crossing detection details)
+//    - Level 7: Per-instruction high-level (e.g., fusion detection, instruction classification)
+//    - Level 8: Per-instruction low-level (e.g., detailed offset calculations, per-instruction details)
+//    - Level 10: detailed debug.
 // DBG macro that takes level as first parameter
 #define DBG(level, ...) do { \
   if (level <= LoopUnrollASMDebug) { \
@@ -64,13 +61,22 @@ static unsigned countLeadingSpaces(const char* str) {
   } \
 } while(0)
 
-// DBG macro for string literals - automatically determines level from leading spaces
-#define DBG_STR(str) do { \
-  unsigned level = (str[0] == ' ') ? countLeadingSpaces(str) : 3; \
-  if (level <= LoopUnrollASMDebug) { \
-    LLVM_DEBUG(dbgs() << str); \
-  } \
+// DBG_SKIP macro for simple skipping messages - calls DBG with level 3 and adds "  skipping: " prefix
+#define DBG_SKIP(str) do { \
+  DBG(3, dbgs() << "  skipping: " << str << "\n"); \
 } while(0)
+
+// DBG_OBSERVED macro for instruction observations - calls DBG with level 7 and adds "    Observed " prefix
+#define DBG_OBSERVED(str, opcode) do { \
+  DBG(7, dbgs() << "    Observed " << str << ": " << opcode << "\n"); \
+} while(0)
+
+// DO_SKIP macro for complete skip pattern - increments statistic, logs skip message, and returns Changed
+#define DO_SKIP(suffix) { \
+  ++NumInnerLoops##suffix; \
+  DBG_SKIP(#suffix); \
+  return Changed; \
+}
 
 // totals
 STATISTIC(NumLoopsDetected, "Number of tight loops detected by LoopUnrollASM");
@@ -234,7 +240,6 @@ bool LoopUnrollASM::runOnMachineFunction(MachineFunction &MF) {
     }
   }
 
-  // Analyze FCMP+FCSEL sequences across cacheline boundaries if enabled
   if (LoopUnrollASMUarch) {
     Changed |= analyzeMachineInsts(MF);
   }
@@ -308,7 +313,7 @@ MachineInstr* LoopUnrollASM::findLoopBackedgeBranch(const MachineLoop* Loop) {
       if (!BranchesToHeader && MI.isConditionalBranch() &&
           (MainBackedgeBlock->getNextNode() == Header)) {
         BranchesToHeader = true;
-        DBG(2, dbgs() << "  backedge falls-through loop header\n");
+        DBG(5, dbgs() << "  backedge falls-through loop header\n");
         ++NumInnerLoops_BackedgeFallthruHeader;
       }
     }
@@ -368,7 +373,7 @@ bool LoopUnrollASM::isCompareBranchFusion(const MachineInstr *CompareInst,
                              (BranchOpName.starts_with("B") || BranchOpName.contains("Bcc"));
 
   if (isFlagProducingCompare && isConditionalBranch) {
-    DBG(4, dbgs() << "    Observed Compare-Branch Fusion (Case 1): "
+    DBG(7, dbgs() << "    Observed Compare-Branch Fusion (Case 1): "
                       << CompareOpName << " + " << BranchOpName << "\n");
     return true;
   }
@@ -409,7 +414,7 @@ bool LoopUnrollASM::isCompareBranchFusion(const MachineInstr *CompareInst,
 
     if (ALUResultReg.isValid() && BranchTestReg.isValid() &&
         ALUResultReg == BranchTestReg) {
-      DBG(4, dbgs() << "    Observed Compare-Branch Fusion (Case 2): "
+      DBG(7, dbgs() << "    Observed Compare-Branch Fusion (Case 2): "
                         << CompareOpName << " + " << BranchOpName << "\n");
       return true;
     }
@@ -458,7 +463,7 @@ bool LoopUnrollASM::isPostIndexMemOp(const MachineInstr &MI) {
   }
 
   if (isPostIndex) {
-    DBG(4, dbgs() << "    Observed post-index instruction in: " << OpcodeName << "\n");
+    DBG_OBSERVED("post-index instruction in", OpcodeName);
   }
 
   return isPostIndex;
@@ -485,7 +490,7 @@ bool LoopUnrollASM::isLoadStorePair(const MachineInstr &MI) {
                   OpcodeName.starts_with("STNP");    // STNP variants (STNPWi, STNPXi, STNPSi, STNPDi, STNPQi, etc.)
 
   if (isPairOp) {
-    DBG(4, dbgs() << "    Observed load/store pair instruction: " << OpcodeName << "\n");
+    DBG_OBSERVED("load/store pair instruction", OpcodeName);
   }
 
   return isPairOp;
@@ -525,10 +530,10 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
 
   MachineBasicBlock *Header = Loop->getHeader();
-  DBG(2, debugPrintLoopInfo(MF, Loop, " Examining"));
+  DBG(3, debugPrintLoopInfo(MF, Loop, " Examining"));
   // Only process innermost loops
   if (!Loop->getSubLoops().empty()) {
-    DBG(2, dbgs() << "  skipping non-innermost\n");
+    DBG_SKIP("non-innermost");
     return Changed;
   }
   ++NumInnermostLoops;
@@ -536,7 +541,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   // Skip loops with too many basic blocks
   if (Loop->getNumBlocks() > 8) {
     ++NumInnerLoopsTooManyBlocks;
-    DBG(2, dbgs() << "  skipping: Too many blocks (" << Loop->getNumBlocks() << " > 8)\n");
+    DBG(4, dbgs() << "  skipping: Too many blocks (" << Loop->getNumBlocks() << " > 8)\n");
     return Changed;
   }
 
@@ -562,8 +567,8 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       StringRef OpcodeName = TII->getName(MI.getOpcode());
       if (OpcodeName.starts_with("FCSEL") && PrevInst && TII->getName(PrevInst->getOpcode()).starts_with("FCMP")) {
         ++NumInnerLoops_HasFcmpFcsel;
-        --LoopCount;
-        LLVM_DEBUG(dbgs() << "    Observed FCMP-FCSEL pair\n");
+        --LoopCount; // assume the pair would not cross cachelines
+        DBG(7, dbgs() << "    Observed FCMP-FCSEL pair\n");
       }
 
       ++LoopCount;
@@ -588,39 +593,36 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       if (OpcodeName == "WFE") {
         // WFE instruction has additional overhead
         ++LoopCount;
-        DBG(4, dbgs() << "    Observed WFE instruction\n");
+        DBG_OBSERVED("WFE instruction", OpcodeName);
       }
       // Check for Pointer Authentication (AUT*) instructions
       else if (startsWithAny({"AUT"})) {
         // Pointer Authentication instructions have additional overhead
         ++LoopCount;
-        DBG(4, dbgs() << "    Observed Pointer Authentication instruction: " << OpcodeName << "\n");
+        DBG_OBSERVED("Pointer Authentication instruction", OpcodeName);
       }
       // Atomic instructions are multiple operations
       // LDADD* variants (LDADD, LDADDA, LDADDAL, LDADDL, etc.)
       // CAS* variants (CAS, CASA, CASAL, CASL, CASB, CASH, etc.)
       else if (startsWithAny({"LDADD", "CAS"})) {
         LoopCount += 3;
-        DBG(4, dbgs() << "    Observed atomic instruction: " << OpcodeName << "\n");
+        DBG_OBSERVED("atomic instruction", OpcodeName);
       }
       // Check for integer MADD (Multiply-Add) instructions
       // MADD, MADDWrrr, MADDXrrr, SMADDL, UMADDL (but not FMADD for floating-point)
       else if (startsWithAny({"MADD", "SMADD", "UMADD"}) && !OpcodeName.starts_with("FMADD")) {
         // Integer multiply-add has additional overhead
         ++LoopCount;
-        DBG(4, dbgs() << "    Observed integer MADD instruction: " << OpcodeName << "\n");
-        if (OpcodeName.starts_with("MADD")) {
-          ++NumInnerLoopsHasMadd;
-          DBG(2, dbgs() << "  skipping: MADD instruction\n");
-          return Changed;
-        }
+        DBG_OBSERVED("integer MADD instruction", OpcodeName);
+        if (OpcodeName.starts_with("MADD"))
+          DO_SKIP(HasMadd);
       }
       // Check for Synchronization Barrier instructions
       // DMB (Data Memory Barrier), DSB (Data Synchronization Barrier), ISB (Instruction Synchronization Barrier)
       else if (startsWithAny({"DMB", "DSB", "ISB"})) {
         // Synchronization barriers have very significant overhead (4 additional cycles)
         LoopCount += 4;
-        DBG(4, dbgs() << "    Observed synchronization barrier instruction: " << OpcodeName << "\n");
+        DBG_OBSERVED("synchronization barrier instruction", OpcodeName);
       }
 
       // We want to exclude loops with any control flow changing instructions
@@ -704,18 +706,20 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 
       if (MI.isUnconditionalBranch() && branchTargetsExit(&MI)) {
         lastUnconditionalExitBranch = &MI;
-        DBG(2, dbgs() << "  Loop ends with unconditional exit branch\n");
+        DBG(4, dbgs() << "  Loop ends with unconditional exit branch\n");
       }
       break; // Found the first valid instruction before backedge
     }
   }
 
   // Check if this is a loop with multiple terminators where all non-backedge terminators target exit
-  DBG(2, {dbgs() << "  info: NumTerminators=" << NumTerminators
+  DBG(7, {dbgs() << "  info: NumTerminators=" << NumTerminators
                      << " isLoopSimplifyForm=" << isLoopSimplifyForm(Loop)
                      << " endsUncondExitBranch=" << (lastUnconditionalExitBranch != nullptr)
                      << " InternalBranches=" << InternalBranches.size()
                      << "\n";
+  });
+  DBG(8, {
     for (auto T: Terminators)
       dbgs() << "    info: cond=" << T->isConditionalBranch() <<
                 " branchTargetsExit=" << branchTargetsExit(T) <<
@@ -725,11 +729,8 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   MachineBasicBlock *Latch = Loop->getLoopLatch();
   if (Pattern == Nonsupported && Latch) {
     MachineBasicBlock::iterator LastIter = Latch->getLastNonDebugInstr();
-    if (LastIter == Latch->end()) {
-      ++NumInnerLoopsInvalid;
-      DBG(2, dbgs() << "  skipping: Invalid loop: No non-debug instructions\n");
-      return Changed;
-    }
+    if (LastIter == Latch->end())
+      DO_SKIP(Invalid);
 
     // Check for backedge conditional followed by unconditional exit in the Latch block
     // TODO: tweak the loop_with_cond_uncond_pattern test to be detected here (avoid Branch Folding optimization)
@@ -744,11 +745,11 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         // Pattern 1: conditional branch followed by unconditional branch
         if (LoopUnrollASMEnable & 0x2) {
           Pattern = Two_Backedge_Uncond;
-          DBG(2, dbgs() << "  Detected Two_Backedge_Uncond pattern\n");
+          DBG(4, dbgs() << "  Detected Two_Backedge_Uncond pattern\n");
         }
         if (Last != lastUnconditionalExitBranch) {
           ++NumInnerLoops_InvalidUncondExit;
-          DBG(2, dbgs() << "    Last != lastUnconditionalExitBranc\n");
+          DBG(4, dbgs() << "    Last != lastUnconditionalExitBranc\n");
         }
       }
     }
@@ -766,7 +767,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     if (Pattern == Nonsupported && lastUnconditionalExitBranch && NumTerminators == 2 && BackedgeBranch) {
       if (LoopUnrollASMEnable & 0x2) {
         Pattern = Two_Backedge_Uncond;
-        DBG(2, dbgs() << "  Detected Two_Backedge_Uncond pattern; fixup\n");
+        DBG(4, dbgs() << "  Detected Two_Backedge_Uncond pattern; fixup\n");
       }
     }
 
@@ -782,7 +783,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       }
       if (allOthersTargetExit && (LoopUnrollASMEnable & 0x4)) {
         Pattern = Multi_CondExit_Backedge;
-        DBG(2, dbgs() << "  Detected Multi_CondExit_Backedge pattern ("
+        DBG(4, dbgs() << "  Detected Multi_CondExit_Backedge pattern ("
                           << NumTerminators << " terminators: exit branches + backedge)\n");
       }
     }
@@ -794,54 +795,39 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         ++NumInnerLoopsMultipleTerminators3;
       else if (NumTerminators >= 4)
         ++NumInnerLoopsMultipleTerminators4Plus;
-      DBG(2, dbgs() << "  skipping: Multiple terminators (" << NumTerminators << ", not accepted pattern)\n");
+      DBG(4, dbgs() << "  skipping: Multiple terminators (" << NumTerminators << ", not accepted pattern)\n");
       return Changed;
     }
   } // NumTerminators > 1
 
-  if (!BackedgeBranch) {
-    ++NumInnerLoopsBranchConditionalNoBackedge;
-    DBG(2, dbgs() << "  skipping: Loop has no backedge branch\n");
-    return Changed;
-  }
+  if (!BackedgeBranch)
+    DO_SKIP(BranchConditionalNoBackedge);
 
   SmallVector<MachineBasicBlock *, 4> Latches;
   Loop->getLoopLatches(Latches);
   assert(Latches.size() == 1 && "Loop must have single latch");
 
   // Classify the branch type and skip if not suitable for unrolling
-  if (BackedgeBranch->isUnconditionalBranch()) {
-    ++NumInnerLoopsBranchUnconditional;
-    DBG(2, dbgs() << "  skipping: Unconditional branch\n");
-    // TODO: we should be able to unroll simple cases like:
-    // Loop:  inst1
-    //        b.eq Exit
-    //        b Loop
-    //  Exit:
-    return Changed;
-  }
+  // TODO: we should be able to unroll simple cases like:
+  // Loop:  inst1
+  //        b.eq Exit
+  //        b Loop
+  //  Exit:
+  if (BackedgeBranch->isUnconditionalBranch())
+    DO_SKIP(BranchUnconditional);
 
-  if (BackedgeBranch->isIndirectBranch()) {
-    ++NumInnerLoopsBranchIndirect;
-    DBG(2, dbgs() << "  skipping: Indirect branch\n");
-    return Changed;
-  }
+  if (BackedgeBranch->isIndirectBranch())
+    DO_SKIP(BranchIndirect);
   assert(BackedgeBranch->isConditionalBranch() && "Loop with non-conditional backedge branch!");
 
   // Check if this is a single basic block loop (Head == Latch)
   // Exception: Multi_CondExit_Backedge pattern can have multiple blocks
-  if (Pattern != Multi_CondExit_Backedge && (!Header || !Latch || Header != Latch)) {
-    ++NumInnerLoopsNotSingleBB;
-    DBG(2, dbgs() << "  skipping: Not single BB (Header != Latch)\n");
-    return Changed;
-  }
+  if (Pattern != Multi_CondExit_Backedge && (!Header || !Latch || Header != Latch))
+    DO_SKIP(NotSingleBB);
 
 #ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
-  if (hasAtomicOps) {
-    ++NumInnerLoopsHasAtomicOps;
-    DBG(2, dbgs() << "  skipping: Has atomic ops\n");
-    return Changed;
-  }
+  if (hasAtomicOps)
+    DO_SKIP(HasAtomicOps);
 #endif
 
   // Find all exit blocks (successors that are outside the loop)
@@ -854,22 +840,16 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       }
     }
   }
-  if (ExitBlocks.empty()) {
-    ++NumInnerLoopsInvalid;
-    DBG(2, dbgs() << "  skipping: Invalid loop: no exit blocks\n");
-    return Changed;
-  }
+  if (ExitBlocks.empty())
+    DO_SKIP(Invalid);
   MachineBasicBlock *ExitBlock = ExitBlocks[0];
 
-  if (!InternalBranches.empty()) {
-    ++NumInnerLoopsHasInternalBranch;
-    DBG(2, dbgs() << "  skipping: Has internal branch\n");
-    return Changed;
-  }
+  if (!InternalBranches.empty())
+    DO_SKIP(HasInternalBranch);
 
   if (LoopCount >= LoopUnrollASMMaxInsts) {
     ++NumInnerLoopsTooManyInsts;
-    DBG(2, dbgs() << "  skipping: Too many instructions (" << LoopCount << " >= " << LoopUnrollASMMaxInsts << ")\n");
+    DBG(4, dbgs() << "  skipping: Too many instructions (" << LoopCount << " >= " << LoopUnrollASMMaxInsts << ")\n");
     return Changed;
   }
 
@@ -896,7 +876,7 @@ void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
     }
   }
 
-  DBG(2, {
+  DBG(3, {
     dbgs() << Prefix << " loop; ";
     if (DL) {
       dbgs() << "Source location: ";
@@ -966,7 +946,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     // Analyze the original branch to extract condition
     MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
     if (TII->analyzeBranch(*Backedge.Branch->getParent(), TBB, FBB, Backedge.Cond)) {
-      DBG(2, dbgs() << "  Unable to analyze branch for unrolling\n");
+      DBG(4, dbgs() << "  Unable to analyze branch for unrolling\n");
       ++NumInnerLoopsBranchPrepFailure;
       return false;
     }
@@ -975,7 +955,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     if (TBB && !FBB) {
       MachineBasicBlock *FallthroughBB = Backedge.Branch->getParent()->getNextNode();
       if (FallthroughBB && FallthroughBB != Backedge.ExitBlock) {
-        DBG(2, dbgs() << "  saw a different fallthrough vs exit blocks\n");
+        DBG(4, dbgs() << "  saw a different fallthrough vs exit blocks\n");
         Backedge.ExitBlock = FallthroughBB;
       }
     }
@@ -983,12 +963,12 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     // Try to invert the condition
     Backedge.InvertedCond = Backedge.Cond;
     if (TII->reverseBranchCondition(Backedge.InvertedCond)) {
-      DBG(2, dbgs() << "  Unable to invert branch condition, skipping unrolling\n");
+      DBG(4, dbgs() << "  Unable to invert branch condition, skipping unrolling\n");
       ++NumInnerLoopsBranchPrepFailure;
       return false;
     }
 
-    DBG(2, {debugPrintLoopInfo(MF, Loop, " Found qualifying", Backedge.ExitBlock);
+    DBG(3, {debugPrintLoopInfo(MF, Loop, " Found qualifying", Backedge.ExitBlock);
       dbgs() << "  with Loop count: " << LoopCount << "\n";});
     unsigned UC = findBestUnrollCount(LoopCount, Bubbles, MachineWidth);
     duplicateLoopBody(Loop, UC, Backedge);
@@ -1001,7 +981,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     }
     return true;
   }
-  DBG(2, dbgs() << "  bubbles are good\n");
+  DBG(4, dbgs() << "  bubbles are good\n");
 
   ++NumLoopsNotEnoughBubbles;
   return false;
@@ -1025,6 +1005,7 @@ unsigned LoopUnrollASM::findBestUnrollCount(unsigned LoopCount,
     unsigned NewBubbles = calculateBubbles(NewLoopCount);
     // Update best unroll count if we found fewer bubbles
     if (NewBubbles < Bubbles) {
+      DBG(10, dbgs() << "     findBestUnrollCount: Bubbles=" << Bubbles << " NewBubbles=" << NewBubbles << " UC=" << UC << "\n");
       BestUC = UC;
       Bubbles = NewBubbles; // Update Bubbles for comparison in next iteration
     }
@@ -1083,7 +1064,7 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   for (const auto &Entry : InstsToClone)
     TotalInsts += Entry.second.size();
   TotalInsts += 1; // for Backedge terminator
-  DBG(2, dbgs() << "  Original loop has " << TotalInsts << " instructions spanning " << Loop->getNumBlocks() << " blocks.\n");
+  DBG(4, dbgs() << "  Original loop has " << TotalInsts << " instructions spanning " << Loop->getNumBlocks() << " blocks.\n");
 
   // We need to create new basic blocks for proper control flow
   // The structure will be:
@@ -1247,7 +1228,7 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
     }
   }
 
-  DBG(2, dbgs() << "  Duplicated loop body with unroll factor " << UnrollFactor << "\n");
+  DBG(4, dbgs() << "  Duplicated loop body with unroll factor " << UnrollFactor << "\n");
 
   // Verify instruction count matches expectations
   unsigned NewLoopInstCount = 0;
@@ -1307,7 +1288,7 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
   assert(isPowerOf2_32(AlignmentValue) &&
          "Function alignment must be a power of 2");
 
-  DBG(2, dbgs() << " Examining alignment. Function alignment: " << AlignmentValue << " bytes"
+  DBG(1, dbgs() << " Examining alignment. Function alignment: " << AlignmentValue << " bytes"
                 << ", IR alignment: " << IRAlignmentValue << "\n");
 
   // Without the actual address, we can only know possible offsets from 64-byte boundary
@@ -1334,7 +1315,7 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
         MachineLoop *Loop = MLI->getLoopFor(&MBB);
         if (!Loop || !Loop->getSubLoops().empty()) {
           // Skip if not in a loop or not in an innermost loop
-          DBG(2, dbgs() << "Skipping MBB " << MBB.getName()
+          DBG(5, dbgs() << "Skipping MBB " << MBB.getName()
                            << " - not in innermost loop\n");
           ++NumUarchMBBsSkippedNotInnermost;
           PrevIteratedMBB = &MBB; // Update previous MBB even when skipping
@@ -1352,7 +1333,7 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
         if (MI.isDebugInstr() || MI.isPseudo())
           continue;
 
-        DBG(5, dbgs() << "     InstOffset=" << (CurrentOffset + FuncStartOffset / 4)
+        DBG(8, dbgs() << "     InstOffset=" << (CurrentOffset + FuncStartOffset / 4)
                       << " BB=" << MBB.getNumber()
                       << " FuncOffset=" << FuncStartOffset
                       << " " << MI);
@@ -1362,14 +1343,14 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
         // Check if previous instruction was FCMP and current is FCSEL
         if (PrevInstr && (CurrentOffset % 2) == 0 && OpcodeName.starts_with("FCSEL")
             && TII->getName(PrevInstr->getOpcode()).starts_with("FCMP")) {
-          DBG(4, dbgs() << "    FCMP at odd offset: PrevOffset=" << (CurrentOffset - 1) << " CurrentOffset=" << CurrentOffset << "\n");
+          DBG(8, dbgs() << "    FCMP at odd offset: PrevOffset=" << (CurrentOffset - 1) << " CurrentOffset=" << CurrentOffset << "\n");
           // Calculate actual offsets including function start offset
           unsigned FCMPActualOffset = (CurrentOffset - 1) * 4 + FuncStartOffset;
           unsigned FCSELActualOffset = CurrentOffset * 4 + FuncStartOffset;
 
           // Check if FCMP and FCSEL cross cacheline boundaries (cacheline is offset / 16)
           if ((FCMPActualOffset / 16) != (FCSELActualOffset / 16)) {
-            DBG(4, {
+            DBG(6, {
               dbgs() << "    FuncStartOffset=" << FuncStartOffset << " CurrentOffset=" << CurrentOffset << " FoundCrossing=1 BB=" << MBB.getNumber() << "\n";
               dbgs() << "    " << MI;
               // Find the next real (non-debug, non-pseudo) instruction
@@ -1390,7 +1371,7 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
             auto InsertPos = (TargetMBB == PrevIteratedMBB) ? TargetMBB->getFirstTerminator() : TargetMBB->begin();
             TII->insertNoop(*TargetMBB, InsertPos);
             // TODO: > remove function name in debug print. Instead, if the MBB belongs to a loop, print its info invoking debugPrintLoopInfo.
-            DBG(2, {
+            DBG(5, {
               std::string InsertLocation;
               if (PrevIteratedMBB) {
                 InsertLocation = "at end of previous BB" + PrevIteratedMBB->getName().str() + " (before terminators)";
