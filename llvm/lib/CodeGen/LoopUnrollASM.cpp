@@ -38,6 +38,40 @@ using namespace llvm;
 
 #define DEBUG_TYPE "loop-unroll-asm"
 
+static cl::opt<unsigned> LoopUnrollASMDebug(
+    "loop-unroll-asm-debug",
+    cl::desc("Debug level for loop unroll asm pass"),
+    cl::init(2), cl::Hidden);
+
+// Helper function to count leading whitespaces in a string
+static unsigned countLeadingSpaces(const char* str) {
+  unsigned count = 0;
+  while (str[count] == ' ') count++;
+  return count;
+}
+
+// **Debug Level Hierarchy**:
+//    - Level 0: Warning messages (always shown, e.g., "Warning: No backedge blocks found")
+//    - Level 1: Basic function-level information (e.g., "Analyzing function: X")
+//    - Level 2: Standard debug output with indentation (e.g., "  skipping: Too many blocks")
+//    - Level 4: Detailed analysis (instruction observations, fusion detection, etc.)
+//    - Level 5: Per-instruction analysis (FuncStartOffset, InstOffset, BB number, instruction)
+//
+// DBG macro that takes level as first parameter
+#define DBG(level, ...) do { \
+  if (level <= LoopUnrollASMDebug) { \
+    LLVM_DEBUG(__VA_ARGS__); \
+  } \
+} while(0)
+
+// DBG macro for string literals - automatically determines level from leading spaces
+#define DBG_STR(str) do { \
+  unsigned level = (str[0] == ' ') ? countLeadingSpaces(str) : 3; \
+  if (level <= LoopUnrollASMDebug) { \
+    LLVM_DEBUG(dbgs() << str); \
+  } \
+} while(0)
+
 // totals
 STATISTIC(NumLoopsDetected, "Number of tight loops detected by LoopUnrollASM");
 STATISTIC(NumLoopsUnrolled, "Number of tight loops unrolled by LoopUnrollASM");
@@ -63,7 +97,7 @@ STATISTIC(NumInnerLoopsTooManyInsts, "Number of inner loops skipped (too many in
 STATISTIC(NumInnerLoopsBranchPrepFailure, "Number of loops skipped (branch analysis or condition inversion failed)");
 // dev stats
 STATISTIC(NumInnerLoops_BackedgeFallthruHeader, "Number of inner loops where Backedge branch fallsthrough into Loop Header");
-STATISTIC(NumInnerLoops_HasFcsel, "Number of inner loops with FCSEL inst");
+STATISTIC(NumInnerLoops_HasFcmpFcsel, "Number of inner loops with FCMP-FCSEL pair");
 STATISTIC(NumInnerLoops_InvalidUncondExit, "Number of inner loops ending with weird unconditional exit branch");
 STATISTIC(NumInnerLoops_LastInstNotBranch, "Number of inner loops where last instruction is not a branch");
 // uarch pass
@@ -181,9 +215,12 @@ INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
 INITIALIZE_PASS_END(LoopUnrollASM, DEBUG_TYPE, "Loop Unroll at Assembly Level", false, false)
 
 bool LoopUnrollASM::runOnMachineFunction(MachineFunction &MF) {
+  if (!LoopUnrollASMEnable && !LoopUnrollASMUarch)
+    return false;
+  DBG(1, dbgs() << "Analyzing function: " << MF.getName() << "\n");
+
   TII = MF.getSubtarget().getInstrInfo();
   MLI = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
-
   bool Changed = false;
 
   // Process loops if enabled
@@ -220,7 +257,7 @@ MachineInstr* LoopUnrollASM::findLoopBackedgeBranch(const MachineLoop* Loop) {
         break; // A block can only have one edge to the header
       }
   if (BackedgeBlocks.empty()) {
-    LLVM_DEBUG(dbgs() << "Warning: No backedge blocks found for loop\n");
+    DBG(0, dbgs() << "Warning: No backedge blocks found for loop\n");
     return nullptr;
   }
 
@@ -242,7 +279,7 @@ MachineInstr* LoopUnrollASM::findLoopBackedgeBranch(const MachineLoop* Loop) {
     } else {
       // Fallback: choose the last backedge block
       MainBackedgeBlock = BackedgeBlocks.back();
-      LLVM_DEBUG(dbgs() << "Warning: Multiple backedge blocks, choosing block "
+      DBG(0, dbgs() << "Warning: Multiple backedge blocks, choosing block "
                         << MainBackedgeBlock->getNumber() << "\n");
     }
   }
@@ -271,7 +308,7 @@ MachineInstr* LoopUnrollASM::findLoopBackedgeBranch(const MachineLoop* Loop) {
       if (!BranchesToHeader && MI.isConditionalBranch() &&
           (MainBackedgeBlock->getNextNode() == Header)) {
         BranchesToHeader = true;
-        LLVM_DEBUG(dbgs() << "  backedge falls-through loop header\n");
+        DBG(2, dbgs() << "  backedge falls-through loop header\n");
         ++NumInnerLoops_BackedgeFallthruHeader;
       }
     }
@@ -282,7 +319,7 @@ MachineInstr* LoopUnrollASM::findLoopBackedgeBranch(const MachineLoop* Loop) {
     }
   }
 
-  LLVM_DEBUG(if (!BackedgeBranch) dbgs() << "Warning: No branch found that targets loop header\n");
+  DBG(0, if (!BackedgeBranch) dbgs() << "Warning: No branch found that targets loop header\n");
 
   return BackedgeBranch;
 }
@@ -331,7 +368,7 @@ bool LoopUnrollASM::isCompareBranchFusion(const MachineInstr *CompareInst,
                              (BranchOpName.starts_with("B") || BranchOpName.contains("Bcc"));
 
   if (isFlagProducingCompare && isConditionalBranch) {
-    LLVM_DEBUG(dbgs() << "    Observed Compare-Branch Fusion (Case 1): "
+    DBG(4, dbgs() << "    Observed Compare-Branch Fusion (Case 1): "
                       << CompareOpName << " + " << BranchOpName << "\n");
     return true;
   }
@@ -372,7 +409,7 @@ bool LoopUnrollASM::isCompareBranchFusion(const MachineInstr *CompareInst,
 
     if (ALUResultReg.isValid() && BranchTestReg.isValid() &&
         ALUResultReg == BranchTestReg) {
-      LLVM_DEBUG(dbgs() << "    Observed Compare-Branch Fusion (Case 2): "
+      DBG(4, dbgs() << "    Observed Compare-Branch Fusion (Case 2): "
                         << CompareOpName << " + " << BranchOpName << "\n");
       return true;
     }
@@ -421,7 +458,7 @@ bool LoopUnrollASM::isPostIndexMemOp(const MachineInstr &MI) {
   }
 
   if (isPostIndex) {
-    LLVM_DEBUG(dbgs() << "    Observed post-index instruction in: " << OpcodeName << "\n");
+    DBG(4, dbgs() << "    Observed post-index instruction in: " << OpcodeName << "\n");
   }
 
   return isPostIndex;
@@ -448,7 +485,7 @@ bool LoopUnrollASM::isLoadStorePair(const MachineInstr &MI) {
                   OpcodeName.starts_with("STNP");    // STNP variants (STNPWi, STNPXi, STNPSi, STNPDi, STNPQi, etc.)
 
   if (isPairOp) {
-    LLVM_DEBUG(dbgs() << "    Observed load/store pair instruction: " << OpcodeName << "\n");
+    DBG(4, dbgs() << "    Observed load/store pair instruction: " << OpcodeName << "\n");
   }
 
   return isPairOp;
@@ -488,11 +525,10 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
 
   MachineBasicBlock *Header = Loop->getHeader();
-  LLVM_DEBUG(debugPrintLoopInfo(MF, Loop, "Examining"));
+  DBG(2, debugPrintLoopInfo(MF, Loop, " Examining"));
   // Only process innermost loops
   if (!Loop->getSubLoops().empty()) {
-    //LLVM_DEBUG(dbgs() << "skipping some non-innermost\n");
-    LLVM_DEBUG(dbgs() << "  skipping non-innermost\n");
+    DBG(2, dbgs() << "  skipping non-innermost\n");
     return Changed;
   }
   ++NumInnermostLoops;
@@ -500,7 +536,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   // Skip loops with too many basic blocks
   if (Loop->getNumBlocks() > 8) {
     ++NumInnerLoopsTooManyBlocks;
-    LLVM_DEBUG(dbgs() << "  skipping: Too many blocks (" << Loop->getNumBlocks() << " > 8)\n");
+    DBG(2, dbgs() << "  skipping: Too many blocks (" << Loop->getNumBlocks() << " > 8)\n");
     return Changed;
   }
 
@@ -525,7 +561,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 
       StringRef OpcodeName = TII->getName(MI.getOpcode());
       if (OpcodeName.starts_with("FCSEL")) {
-        ++NumInnerLoops_HasFcsel;
+        ++NumInnerLoops_HasFcmpFcsel;
         if (1){//PrevInst && TII->getName(PrevInst->getOpcode()).starts_with("FCMP")) {
           --LoopCount;
           LLVM_DEBUG(dbgs() << "    skipping: FCMP-FCSEL pair\n");
@@ -555,30 +591,30 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       if (OpcodeName == "WFE") {
         // WFE instruction has additional overhead
         ++LoopCount;
-        LLVM_DEBUG(dbgs() << "    Observed WFE instruction\n");
+        DBG(4, dbgs() << "    Observed WFE instruction\n");
       }
       // Check for Pointer Authentication (AUT*) instructions
       else if (startsWithAny({"AUT"})) {
         // Pointer Authentication instructions have additional overhead
         ++LoopCount;
-        LLVM_DEBUG(dbgs() << "    Observed Pointer Authentication instruction: " << OpcodeName << "\n");
+        DBG(4, dbgs() << "    Observed Pointer Authentication instruction: " << OpcodeName << "\n");
       }
       // Atomic instructions are multiple operations
       // LDADD* variants (LDADD, LDADDA, LDADDAL, LDADDL, etc.)
       // CAS* variants (CAS, CASA, CASAL, CASL, CASB, CASH, etc.)
       else if (startsWithAny({"LDADD", "CAS"})) {
         LoopCount += 3;
-        LLVM_DEBUG(dbgs() << "    Observed atomic instruction: " << OpcodeName << "\n");
+        DBG(4, dbgs() << "    Observed atomic instruction: " << OpcodeName << "\n");
       }
       // Check for integer MADD (Multiply-Add) instructions
       // MADD, MADDWrrr, MADDXrrr, SMADDL, UMADDL (but not FMADD for floating-point)
       else if (startsWithAny({"MADD", "SMADD", "UMADD"}) && !OpcodeName.starts_with("FMADD")) {
         // Integer multiply-add has additional overhead
         ++LoopCount;
-        LLVM_DEBUG(dbgs() << "    Observed integer MADD instruction: " << OpcodeName << "\n");
+        DBG(4, dbgs() << "    Observed integer MADD instruction: " << OpcodeName << "\n");
         if (OpcodeName.starts_with("MADD")) {
           ++NumInnerLoopsHasMadd;
-          LLVM_DEBUG(dbgs() << "  skipping: MADD instruction\n");
+          DBG(2, dbgs() << "  skipping: MADD instruction\n");
           return Changed;
         }
       }
@@ -587,7 +623,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       else if (startsWithAny({"DMB", "DSB", "ISB"})) {
         // Synchronization barriers have very significant overhead (4 additional cycles)
         LoopCount += 4;
-        LLVM_DEBUG(dbgs() << "    Observed synchronization barrier instruction: " << OpcodeName << "\n");
+        DBG(4, dbgs() << "    Observed synchronization barrier instruction: " << OpcodeName << "\n");
       }
 
       // We want to exclude loops with any control flow changing instructions
@@ -671,14 +707,14 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 
       if (MI.isUnconditionalBranch() && branchTargetsExit(&MI)) {
         lastUnconditionalExitBranch = &MI;
-        LLVM_DEBUG(dbgs() << "  Loop ends with unconditional exit branch\n");
+        DBG(2, dbgs() << "  Loop ends with unconditional exit branch\n");
       }
       break; // Found the first valid instruction before backedge
     }
   }
 
   // Check if this is a loop with multiple terminators where all non-backedge terminators target exit
-  LLVM_DEBUG({dbgs() << "  info: NumTerminators=" << NumTerminators
+  DBG(2, {dbgs() << "  info: NumTerminators=" << NumTerminators
                      << " isLoopSimplifyForm=" << isLoopSimplifyForm(Loop)
                      << " endsUncondExitBranch=" << (lastUnconditionalExitBranch != nullptr)
                      << " InternalBranches=" << InternalBranches.size()
@@ -694,7 +730,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     MachineBasicBlock::iterator LastIter = Latch->getLastNonDebugInstr();
     if (LastIter == Latch->end()) {
       ++NumInnerLoopsInvalid;
-      LLVM_DEBUG(dbgs() << "  skipping: Invalid loop: No non-debug instructions\n");
+      DBG(2, dbgs() << "  skipping: Invalid loop: No non-debug instructions\n");
       return Changed;
     }
 
@@ -711,11 +747,11 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         // Pattern 1: conditional branch followed by unconditional branch
         if (LoopUnrollASMEnable & 0x2) {
           Pattern = Two_Backedge_Uncond;
-          LLVM_DEBUG(dbgs() << "  Detected Two_Backedge_Uncond pattern\n");
+          DBG(2, dbgs() << "  Detected Two_Backedge_Uncond pattern\n");
         }
         if (Last != lastUnconditionalExitBranch) {
           ++NumInnerLoops_InvalidUncondExit;
-          LLVM_DEBUG(dbgs() << "    Last != lastUnconditionalExitBranc\n");
+          DBG(2, dbgs() << "    Last != lastUnconditionalExitBranc\n");
         }
       }
     }
@@ -724,7 +760,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     // In some cases (e.g., when there are no terminators), Last may not be a branch
     if (Pattern == Nonsupported && !Last->isBranch()) {
       ++NumInnerLoops_LastInstNotBranch;
-      LLVM_DEBUG(dbgs() << "  warning: Invalid loop: Last instruction is not a branch\n");
+      DBG(0, dbgs() << "  warning: Invalid loop: Last instruction is not a branch\n");
       //return Changed;
     }
   }
@@ -733,7 +769,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     if (Pattern == Nonsupported && lastUnconditionalExitBranch && NumTerminators == 2 && BackedgeBranch) {
       if (LoopUnrollASMEnable & 0x2) {
         Pattern = Two_Backedge_Uncond;
-        LLVM_DEBUG(dbgs() << "  Detected Two_Backedge_Uncond pattern; fixup\n");
+        DBG(2, dbgs() << "  Detected Two_Backedge_Uncond pattern; fixup\n");
       }
     }
 
@@ -749,7 +785,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       }
       if (allOthersTargetExit && (LoopUnrollASMEnable & 0x4)) {
         Pattern = Multi_CondExit_Backedge;
-        LLVM_DEBUG(dbgs() << "  Detected Multi_CondExit_Backedge pattern ("
+        DBG(2, dbgs() << "  Detected Multi_CondExit_Backedge pattern ("
                           << NumTerminators << " terminators: exit branches + backedge)\n");
       }
     }
@@ -761,14 +797,14 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         ++NumInnerLoopsMultipleTerminators3;
       else if (NumTerminators >= 4)
         ++NumInnerLoopsMultipleTerminators4Plus;
-      LLVM_DEBUG(dbgs() << "  skipping: Multiple terminators (" << NumTerminators << ", not accepted pattern)\n");
+      DBG(2, dbgs() << "  skipping: Multiple terminators (" << NumTerminators << ", not accepted pattern)\n");
       return Changed;
     }
   } // NumTerminators > 1
 
   if (!BackedgeBranch) {
     ++NumInnerLoopsBranchConditionalNoBackedge;
-    LLVM_DEBUG(dbgs() << "  skipping: Loop has no backedge branch\n");
+    DBG(2, dbgs() << "  skipping: Loop has no backedge branch\n");
     return Changed;
   }
 
@@ -779,7 +815,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   // Classify the branch type and skip if not suitable for unrolling
   if (BackedgeBranch->isUnconditionalBranch()) {
     ++NumInnerLoopsBranchUnconditional;
-    LLVM_DEBUG(dbgs() << "  skipping: Unconditional branch\n");
+    DBG(2, dbgs() << "  skipping: Unconditional branch\n");
     // TODO: we should be able to unroll simple cases like:
     // Loop:  inst1
     //        b.eq Exit
@@ -790,7 +826,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 
   if (BackedgeBranch->isIndirectBranch()) {
     ++NumInnerLoopsBranchIndirect;
-    LLVM_DEBUG(dbgs() << "  skipping: Indirect branch\n");
+    DBG(2, dbgs() << "  skipping: Indirect branch\n");
     return Changed;
   }
   assert(BackedgeBranch->isConditionalBranch() && "Loop with non-conditional backedge branch!");
@@ -799,14 +835,14 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   // Exception: Multi_CondExit_Backedge pattern can have multiple blocks
   if (Pattern != Multi_CondExit_Backedge && (!Header || !Latch || Header != Latch)) {
     ++NumInnerLoopsNotSingleBB;
-    LLVM_DEBUG(dbgs() << "  skipping: Not single BB (Header != Latch)\n");
+    DBG(2, dbgs() << "  skipping: Not single BB (Header != Latch)\n");
     return Changed;
   }
 
 #ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
   if (hasAtomicOps) {
     ++NumInnerLoopsHasAtomicOps;
-    LLVM_DEBUG(dbgs() << "  skipping: Has atomic ops\n");
+    DBG(2, dbgs() << "  skipping: Has atomic ops\n");
     return Changed;
   }
 #endif
@@ -823,20 +859,20 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   }
   if (ExitBlocks.empty()) {
     ++NumInnerLoopsInvalid;
-    LLVM_DEBUG(dbgs() << "  skipping: Invalid loop: no exit blocks\n");
+    DBG(2, dbgs() << "  skipping: Invalid loop: no exit blocks\n");
     return Changed;
   }
   MachineBasicBlock *ExitBlock = ExitBlocks[0];
 
   if (!InternalBranches.empty()) {
     ++NumInnerLoopsHasInternalBranch;
-    LLVM_DEBUG(dbgs() << "  skipping: Has internal branch\n");
+    DBG(2, dbgs() << "  skipping: Has internal branch\n");
     return Changed;
   }
 
   if (LoopCount >= LoopUnrollASMMaxInsts) {
     ++NumInnerLoopsTooManyInsts;
-    LLVM_DEBUG(dbgs() << "  skipping: Too many instructions (" << LoopCount << " >= " << LoopUnrollASMMaxInsts << ")\n");
+    DBG(2, dbgs() << "  skipping: Too many instructions (" << LoopCount << " >= " << LoopUnrollASMMaxInsts << ")\n");
     return Changed;
   }
 
@@ -863,10 +899,10 @@ void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
     }
   }
 
-  LLVM_DEBUG({
-    dbgs() << Prefix << " loop in function " << MF.getName() << "\n";
+  DBG(2, {
+    dbgs() << Prefix << " loop; ";
     if (DL) {
-      dbgs() << "  Source location: ";
+      dbgs() << "Source location: ";
       if (DL.getLine() != 0 && DL.getScope()) {
         if (auto *Scope = dyn_cast<DIScope>(DL.getScope())) {
           dbgs() << Scope->getFilename() << ":" << DL.getLine();
@@ -874,8 +910,10 @@ void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
             dbgs() << ":" << DL.getCol();
         }
       }
-      dbgs() << "\n";
+    } else {
+          dbgs() << Prefix << "in function " << MF.getName();
     }
+    dbgs() << "\n";
 
     // Helper lambda to print block name (use number if symbol name is empty)
     auto printBlockName = [](const MachineBasicBlock *MBB) {
@@ -931,7 +969,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     // Analyze the original branch to extract condition
     MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
     if (TII->analyzeBranch(*Backedge.Branch->getParent(), TBB, FBB, Backedge.Cond)) {
-      LLVM_DEBUG(dbgs() << "  Unable to analyze branch for unrolling\n");
+      DBG(2, dbgs() << "  Unable to analyze branch for unrolling\n");
       ++NumInnerLoopsBranchPrepFailure;
       return false;
     }
@@ -940,7 +978,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     if (TBB && !FBB) {
       MachineBasicBlock *FallthroughBB = Backedge.Branch->getParent()->getNextNode();
       if (FallthroughBB && FallthroughBB != Backedge.ExitBlock) {
-        LLVM_DEBUG(dbgs() << "  saw a different fallthrough vs exit blocks\n");
+        DBG(2, dbgs() << "  saw a different fallthrough vs exit blocks\n");
         Backedge.ExitBlock = FallthroughBB;
       }
     }
@@ -948,12 +986,12 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     // Try to invert the condition
     Backedge.InvertedCond = Backedge.Cond;
     if (TII->reverseBranchCondition(Backedge.InvertedCond)) {
-      LLVM_DEBUG(dbgs() << "  Unable to invert branch condition, skipping unrolling\n");
+      DBG(2, dbgs() << "  Unable to invert branch condition, skipping unrolling\n");
       ++NumInnerLoopsBranchPrepFailure;
       return false;
     }
 
-    LLVM_DEBUG({debugPrintLoopInfo(MF, Loop, "Found qualifying", Backedge.ExitBlock);
+    DBG(2, {debugPrintLoopInfo(MF, Loop, " Found qualifying", Backedge.ExitBlock);
       dbgs() << "  with Loop count: " << LoopCount << "\n";});
     unsigned UC = findBestUnrollCount(LoopCount, Bubbles, MachineWidth);
     duplicateLoopBody(Loop, UC, Backedge);
@@ -966,7 +1004,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
     }
     return true;
   }
-  LLVM_DEBUG(dbgs() << "  bubbles are good\n");
+  DBG(2, dbgs() << "  bubbles are good\n");
 
   ++NumLoopsNotEnoughBubbles;
   return false;
@@ -1048,7 +1086,7 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   for (const auto &Entry : InstsToClone)
     TotalInsts += Entry.second.size();
   TotalInsts += 1; // for Backedge terminator
-  LLVM_DEBUG(dbgs() << "  Original loop has " << TotalInsts << " instructions spanning " << Loop->getNumBlocks() << " blocks.\n");
+  DBG(2, dbgs() << "  Original loop has " << TotalInsts << " instructions spanning " << Loop->getNumBlocks() << " blocks.\n");
 
   // We need to create new basic blocks for proper control flow
   // The structure will be:
@@ -1212,7 +1250,7 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
     }
   }
 
-  LLVM_DEBUG(dbgs() << "  Duplicated loop body with unroll factor " << UnrollFactor << "\n");
+  DBG(2, dbgs() << "  Duplicated loop body with unroll factor " << UnrollFactor << "\n");
 
   // Verify instruction count matches expectations
   unsigned NewLoopInstCount = 0;
@@ -1272,9 +1310,8 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
   assert(isPowerOf2_32(AlignmentValue) &&
          "Function alignment must be a power of 2");
 
-  LLVM_DEBUG(dbgs() << "Analyzing function " << F.getName()
-                    << " with alignment: " << AlignmentValue << " bytes"
-                    << ", IR alignment: " << IRAlignmentValue << "\n");
+  DBG(2, dbgs() << " Examining alignment. Function alignment: " << AlignmentValue << " bytes"
+                << ", IR alignment: " << IRAlignmentValue << "\n");
 
   // Without the actual address, we can only know possible offsets from 64-byte boundary
   // For example, if function is 16-byte aligned, it could start at offsets: 0, 16, 32, 48
@@ -1300,7 +1337,7 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
         MachineLoop *Loop = MLI->getLoopFor(&MBB);
         if (!Loop || !Loop->getSubLoops().empty()) {
           // Skip if not in a loop or not in an innermost loop
-          LLVM_DEBUG(dbgs() << "Skipping MBB " << MBB.getName()
+          DBG(2, dbgs() << "Skipping MBB " << MBB.getName()
                            << " - not in innermost loop\n");
           ++NumUarchMBBsSkippedNotInnermost;
           PrevIteratedMBB = &MBB; // Update previous MBB even when skipping
@@ -1318,28 +1355,33 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
         if (MI.isDebugInstr() || MI.isPseudo())
           continue;
 
+        DBG(5, dbgs() << "     InstOffset=" << (CurrentOffset + FuncStartOffset / 4)
+                      << " BB=" << MBB.getNumber()
+                      << " FuncOffset=" << FuncStartOffset
+                      << " " << MI);
+
         StringRef OpcodeName = TII->getName(MI.getOpcode());
 
         // Check if previous instruction was FCMP and current is FCSEL
         if (PrevInstr && (CurrentOffset % 2) == 0 && OpcodeName.starts_with("FCSEL")
             && TII->getName(PrevInstr->getOpcode()).starts_with("FCMP")) {
-          LLVM_DEBUG(dbgs() << "    FCMP at odd offset: PrevOffset=" << (CurrentOffset - 1) << " CurrentOffset=" << CurrentOffset << "\n");
+          DBG(4, dbgs() << "    FCMP at odd offset: PrevOffset=" << (CurrentOffset - 1) << " CurrentOffset=" << CurrentOffset << "\n");
           // Calculate actual offsets including function start offset
           unsigned FCMPActualOffset = (CurrentOffset - 1) * 4 + FuncStartOffset;
           unsigned FCSELActualOffset = CurrentOffset * 4 + FuncStartOffset;
 
           // Check if FCMP and FCSEL cross cacheline boundaries (cacheline is offset / 16)
           if ((FCMPActualOffset / 16) != (FCSELActualOffset / 16)) {
-            LLVM_DEBUG({
+            DBG(4, {
               dbgs() << "    FuncStartOffset=" << FuncStartOffset << " CurrentOffset=" << CurrentOffset << " FoundCrossing=1 BB=" << MBB.getNumber() << "\n";
-              dbgs() << "    " << MI << "\n";
+              dbgs() << "    " << MI;
               // Find the next real (non-debug, non-pseudo) instruction
               auto NextI = std::next(I);
               while (NextI != E && (NextI->isDebugInstr() || NextI->isPseudo())) {
                 ++NextI;
               }
               if (NextI != E) {
-                dbgs() << "    " << *NextI << "\n";
+                dbgs() << "    " << *NextI;
               }
             });
 
@@ -1351,15 +1393,14 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
             auto InsertPos = (TargetMBB == PrevIteratedMBB) ? TargetMBB->getFirstTerminator() : TargetMBB->begin();
             TII->insertNoop(*TargetMBB, InsertPos);
             // TODO: > remove function name in debug print. Instead, if the MBB belongs to a loop, print its info invoking debugPrintLoopInfo.
-            LLVM_DEBUG({
+            DBG(2, {
               std::string InsertLocation;
               if (PrevIteratedMBB) {
-                InsertLocation = "at end of previous MBB " + PrevIteratedMBB->getName().str() + " (before terminators)";
+                InsertLocation = "at end of previous BB" + PrevIteratedMBB->getName().str() + " (before terminators)";
               } else {
                 InsertLocation = "at start of function (beginning of first MBB)";
               }
-              dbgs() << "  Inserting NOP in function " << F.getName()
-                     << " " << InsertLocation << "\n";
+              dbgs() << "  Inserting NOP in BB" << TargetMBB->getNumber() << " " << InsertLocation << "\n";
             });
             ++NumUarchNOPsInserted;
             ++NumAddedInsts;
