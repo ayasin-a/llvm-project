@@ -560,13 +560,10 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         continue;
 
       StringRef OpcodeName = TII->getName(MI.getOpcode());
-      if (OpcodeName.starts_with("FCSEL")) {
+      if (OpcodeName.starts_with("FCSEL") && PrevInst && TII->getName(PrevInst->getOpcode()).starts_with("FCMP")) {
         ++NumInnerLoops_HasFcmpFcsel;
-        if (1){//PrevInst && TII->getName(PrevInst->getOpcode()).starts_with("FCMP")) {
-          --LoopCount;
-          LLVM_DEBUG(dbgs() << "    skipping: FCMP-FCSEL pair\n");
-          return Changed;
-        }
+        --LoopCount;
+        LLVM_DEBUG(dbgs() << "    Observed FCMP-FCSEL pair\n");
       }
 
       ++LoopCount;
