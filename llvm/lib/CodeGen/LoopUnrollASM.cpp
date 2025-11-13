@@ -106,9 +106,9 @@ STATISTIC(NumInnerLoops_BackedgeFallthruHeader, "Number of inner loops where Bac
 STATISTIC(NumInnerLoops_HasFcmpFcsel, "Number of inner loops with FCMP-FCSEL pair");
 STATISTIC(NumInnerLoops_InvalidUncondExit, "Number of inner loops ending with weird unconditional exit branch");
 STATISTIC(NumInnerLoops_LastInstNotBranch, "Number of inner loops where last instruction is not a branch");
-// uarch pass
-STATISTIC(NumUarchMBBsSkippedNotInnermost, "Number of MBBs skipped (not in innermost loop)");
-STATISTIC(NumUarchNOPsInserted, "Number of NOPs inserted for FCMP+FCSEL cacheline crossings");
+// alignment pass
+STATISTIC(NumAlignMBBsSkippedNotInnermost, "Number of MBBs skipped (not in innermost loop)");
+STATISTIC(NumAlignNOPsInserted, "Number of NOPs inserted for FCMP+FCSEL cacheline crossings");
 
 static cl::opt<unsigned> LoopUnrollASMMaxInsts(
     "loop-unroll-asm-max-insts",
@@ -131,14 +131,14 @@ static cl::opt<unsigned> LoopUnrollASMMinBubbles(
     cl::desc("Minimum number of bubbles to continue searching for better unroll count"),
     cl::init(3), cl::Hidden);
 
-static cl::opt<bool> LoopUnrollASMUarch(
-    "loop-unroll-asm-uarch",
-    cl::desc("Enable microarchitecture-specific analysis"),
+static cl::opt<bool> LoopUnrollASMAlign(
+    "loop-unroll-asm-align",
+    cl::desc("Enable alignment-specific analysis"),
     cl::init(true), cl::Hidden);
 
-static cl::opt<bool> LoopUnrollASMUarchAll(
-    "loop-unroll-asm-uarch-all",
-    cl::desc("Analyze all basic blocks for uarch issues (not just innermost loops)"),
+static cl::opt<bool> LoopUnrollASMAlignAll(
+    "loop-unroll-asm-align-all",
+    cl::desc("Analyze all basic blocks for alignment issues (not just innermost loops)"),
     cl::init(true), cl::Hidden);
 
 namespace {
@@ -186,9 +186,11 @@ private:
   const TargetInstrInfo *TII = nullptr;
   const MachineLoopInfo *MLI = nullptr;
 
+  // TODO: get MachineWidth from TTI / SchedModel
+  static constexpr unsigned MachineWidth = 10;
+
   // Static helper function to calculate bubbles
   static unsigned calculateBubbles(unsigned LoopCount) {
-    const unsigned MachineWidth = 10;
     unsigned Remainder = LoopCount % MachineWidth;
     return Remainder ? MachineWidth - Remainder : 0;
   }
@@ -205,11 +207,11 @@ private:
   bool processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                         MachineBasicBlock *Header, unsigned LoopCount,
                         BackedgeInfo &Backedge);
-  unsigned findBestUnrollCount(unsigned LoopCount, unsigned Bubbles,
-                               unsigned MachineWidth);
+  unsigned findBestUnrollCount(unsigned LoopCount, unsigned Bubbles);
   void duplicateLoopBody(MachineLoop *Loop, unsigned UnrollFactor,
                          const BackedgeInfo &Backedge);
   bool analyzeMachineInsts(MachineFunction &MF);
+  bool isAtomicInstruction(const MachineInstr &MI);
 };
 } // end anonymous namespace
 
@@ -221,7 +223,7 @@ INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
 INITIALIZE_PASS_END(LoopUnrollASM, DEBUG_TYPE, "Loop Unroll at Assembly Level", false, false)
 
 bool LoopUnrollASM::runOnMachineFunction(MachineFunction &MF) {
-  if (!LoopUnrollASMEnable && !LoopUnrollASMUarch)
+  if (!LoopUnrollASMEnable && !LoopUnrollASMAlign)
     return false;
   DBG(1, dbgs() << "Analyzing function: " << MF.getName() << "\n");
 
@@ -240,7 +242,7 @@ bool LoopUnrollASM::runOnMachineFunction(MachineFunction &MF) {
     }
   }
 
-  if (LoopUnrollASMUarch) {
+  if (LoopUnrollASMAlign) {
     Changed |= analyzeMachineInsts(MF);
   }
 
@@ -551,9 +553,6 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   MachineInstr *BackedgeBranch = findLoopBackedgeBranch(Loop);
   unsigned LoopCount = 0;
   SmallVector<MachineInstr *, 4> InternalBranches;
-#ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
-  bool hasAtomicOps = false;
-#endif
 
   // Calculate a precise LoopCount based on the loop size (in # fetch slots)
   // TODO: this should eventually interface with TTI
@@ -601,13 +600,6 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         ++LoopCount;
         DBG_OBSERVED("Pointer Authentication instruction", OpcodeName);
       }
-      // Atomic instructions are multiple operations
-      // LDADD* variants (LDADD, LDADDA, LDADDAL, LDADDL, etc.)
-      // CAS* variants (CAS, CASA, CASAL, CASL, CASB, CASH, etc.)
-      else if (startsWithAny({"LDADD", "CAS"})) {
-        LoopCount += 3;
-        DBG_OBSERVED("atomic instruction", OpcodeName);
-      }
       // Check for integer MADD (Multiply-Add) instructions
       // MADD, MADDWrrr, MADDXrrr, SMADDL, UMADDL (but not FMADD for floating-point)
       else if (startsWithAny({"MADD", "SMADD", "UMADD"}) && !OpcodeName.starts_with("FMADD")) {
@@ -632,40 +624,9 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         InternalBranches.push_back(&MI);
       }
 
-#ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
       // Check for atomic operations
-      // We want to avoid unrolling loops with atomic operations,
-      // especially exclusive load/store operations (ldxr/stxr on ARM)
-      if (MI.hasOrderedMemoryRef() || MI.mayLoadOrStore()) {
-        // Check if this is an atomic operation by looking at the opcode name
-        // or memory operand flags
-        StringRef OpcodeName = TII->getName(MI.getOpcode());
-        // Check for exclusive operations (ARM specific)
-        if (OpcodeName.contains_insensitive("ldxr") ||
-            OpcodeName.contains_insensitive("stxr") ||
-            OpcodeName.contains_insensitive("ldaxr") ||
-            OpcodeName.contains_insensitive("stlxr") ||
-            OpcodeName.contains_insensitive("cas") ||
-            OpcodeName.contains_insensitive("swp") ||
-            OpcodeName.contains_insensitive("ldadd") ||
-            OpcodeName.contains_insensitive("ldclr") ||
-            OpcodeName.contains_insensitive("ldeor") ||
-            OpcodeName.contains_insensitive("ldset")) {
-          hasAtomicOps = true;
-          break;
-        }
-
-        // Also check memory operands for atomic flags
-        for (MachineMemOperand *MMO : MI.memoperands()) {
-          if (MMO->isAtomic()) {
-            hasAtomicOps = true;
-            break;
-          }
-        }
-        if (hasAtomicOps)
-          break;
-      }
-#endif // LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
+      if (isAtomicInstruction(MI))
+        DO_SKIP(HasAtomicOps);
 
       // Track previous instruction for fusion detection
       PrevInst = &MI;
@@ -825,11 +786,6 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   if (Pattern != Multi_CondExit_Backedge && (!Header || !Latch || Header != Latch))
     DO_SKIP(NotSingleBB);
 
-#ifndef LOOPUNROLLASM_ALLOW_ATOMIC_UNROLL
-  if (hasAtomicOps)
-    DO_SKIP(HasAtomicOps);
-#endif
-
   // Find all exit blocks (successors that are outside the loop)
   SmallVector<MachineBasicBlock*, 4> ExitBlocks;
   for (MachineBasicBlock *MBB : Loop->blocks()) {
@@ -934,8 +890,6 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                                      BackedgeInfo &Backedge) {
   ++NumLoopsDetected;
 
-  // TODO: get MachineWidth from TTI / SchedModel
-  const unsigned MachineWidth = 10;
   const unsigned LoopCycles =
       (LoopCount + MachineWidth - 1) / MachineWidth; // round-up int divide
 
@@ -970,7 +924,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
 
     DBG(3, {debugPrintLoopInfo(MF, Loop, " Found qualifying", Backedge.ExitBlock);
       dbgs() << "  with Loop count: " << LoopCount << "\n";});
-    unsigned UC = findBestUnrollCount(LoopCount, Bubbles, MachineWidth);
+    unsigned UC = findBestUnrollCount(LoopCount, Bubbles);
     duplicateLoopBody(Loop, UC, Backedge);
     NumAddedInsts += (UC - 1) * LoopCount;
     ++NumLoopsUnrolled;
@@ -988,8 +942,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
 }
 
 unsigned LoopUnrollASM::findBestUnrollCount(unsigned LoopCount,
-                                            unsigned Bubbles,
-                                            unsigned MachineWidth) {
+                                            unsigned Bubbles) {
   unsigned BestUC = 2; // Start with the default unroll factor of 2
   unsigned UC = 2;
 
@@ -1309,15 +1262,15 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
     MachineBasicBlock* PrevIteratedMBB = nullptr; // Track previous MBB in iteration order
 
     for (MachineBasicBlock &MBB : MF) {
-      // Skip blocks that are not in innermost loops if LoopUnrollASMUarchAll is off
-      if (!LoopUnrollASMUarchAll) {
-        assert(0 && "LoopUnrollASMUarchAll=0 misses Offset adjustment!");
+      // Skip blocks that are not in innermost loops if LoopUnrollASMAlignAll is off
+      if (!LoopUnrollASMAlignAll) {
+        assert(0 && "LoopUnrollASMAlignAll=0 misses Offset adjustment!");
         MachineLoop *Loop = MLI->getLoopFor(&MBB);
         if (!Loop || !Loop->getSubLoops().empty()) {
           // Skip if not in a loop or not in an innermost loop
           DBG(5, dbgs() << "Skipping MBB " << MBB.getName()
                            << " - not in innermost loop\n");
-          ++NumUarchMBBsSkippedNotInnermost;
+          ++NumAlignMBBsSkippedNotInnermost;
           PrevIteratedMBB = &MBB; // Update previous MBB even when skipping
           continue;
         }
@@ -1380,7 +1333,7 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
               }
               dbgs() << "  Inserting NOP in BB" << TargetMBB->getNumber() << " " << InsertLocation << "\n";
             });
-            ++NumUarchNOPsInserted;
+            ++NumAlignNOPsInserted;
             ++NumAddedInsts;
             MadeChanges = true;
 
@@ -1409,6 +1362,39 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
   } // for FuncStartOffset
 
   return MadeChanges;
+}
+
+/// Check if a machine instruction is an atomic operation.
+bool LoopUnrollASM::isAtomicInstruction(const MachineInstr &MI) {
+  if (!MI.hasOrderedMemoryRef() && !MI.mayLoadOrStore())
+    return false;
+
+  // Check if this is an atomic operation by looking at the opcode name
+  // or memory operand flags
+  StringRef OpcodeName = TII->getName(MI.getOpcode());
+
+  // Check for exclusive operations (ARM specific)
+  if (OpcodeName.contains_insensitive("ldxr") ||
+      OpcodeName.contains_insensitive("stxr") ||
+      OpcodeName.contains_insensitive("ldaxr") ||
+      OpcodeName.contains_insensitive("stlxr") ||
+      OpcodeName.contains_insensitive("cas") ||
+      OpcodeName.contains_insensitive("swp") ||
+      OpcodeName.contains_insensitive("ldadd") ||
+      OpcodeName.contains_insensitive("ldclr") ||
+      OpcodeName.contains_insensitive("ldeor") ||
+      OpcodeName.contains_insensitive("ldset")) {
+    return true;
+  }
+
+  // Also check memory operands for atomic flags
+  for (MachineMemOperand *MMO : MI.memoperands()) {
+    if (MMO->isAtomic()) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 FunctionPass *llvm::createLoopUnrollASMPass() {
