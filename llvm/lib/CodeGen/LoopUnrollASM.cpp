@@ -29,6 +29,7 @@
 #include "llvm/Support/Alignment.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
@@ -134,7 +135,10 @@ static cl::opt<unsigned> LoopUnrollASMEnable(
 static cl::opt<unsigned> LoopUnrollASMMinBubbles(
     "loop-unroll-asm-min-bubbles",
     cl::desc("Minimum number of bubbles to continue searching for better unroll count"),
-    cl::init(3), cl::Hidden);
+    cl::init(3), cl::Hidden,
+    cl::callback([](const unsigned &Val) {
+      if (Val == 0) report_fatal_error("loop-unroll-asm-min-bubbles must be at least 1");
+    }));
 
 static cl::opt<bool> LoopUnrollASMAlign(
     "loop-unroll-asm-align",
@@ -501,6 +505,43 @@ bool LoopUnrollASM::isLoadStorePair(const MachineInstr &MI) {
   }
 
   return isPairOp;
+}
+
+/// Check if a machine instruction is an atomic operation.
+bool LoopUnrollASM::isAtomicInstruction(const MachineInstr &MI) {
+  if (!MI.hasOrderedMemoryRef() && !MI.mayLoadOrStore())
+    return false;
+
+  // Check if this is an atomic operation by looking at the opcode name
+  // or memory operand flags
+  StringRef OpcodeName = TII->getName(MI.getOpcode());
+
+  // Check for exclusive operations (ARM specific)
+  if (OpcodeName.contains_insensitive("ldxr") ||
+      OpcodeName.contains_insensitive("stxr") ||
+      OpcodeName.contains_insensitive("ldaxr") ||
+      OpcodeName.contains_insensitive("stlxr") ||
+      OpcodeName.contains_insensitive("cas") ||
+      OpcodeName.contains_insensitive("swp") ||
+      OpcodeName.contains_insensitive("ldadd") ||
+      OpcodeName.contains_insensitive("ldclr") ||
+      OpcodeName.contains_insensitive("ldeor") ||
+      OpcodeName.contains_insensitive("ldset")) {
+    return true;
+  }
+
+  // Also check memory operands for atomic flags
+  for (MachineMemOperand *MMO : MI.memoperands()) {
+    if (MMO->isAtomic()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+FunctionPass *llvm::createLoopUnrollASMPass() {
+  return new LoopUnrollASM();
 }
 
 /// Check if a MachineLoop is in loop simplify form.
@@ -1324,9 +1365,13 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
             // Insert NOP immediately and adjust CurrentOffset for this FuncStartOffset
             // insert at the end of the previous MBB in layout order, if any
             MachineBasicBlock *TargetMBB = PrevIteratedMBB ? PrevIteratedMBB : &*MF.begin();
-            // Insert the NOP
             assert(TargetMBB && "TargetMBB should never be null");
             auto InsertPos = (TargetMBB == PrevIteratedMBB) ? TargetMBB->getFirstTerminator() : TargetMBB->begin();
+            // Move InsertPos one instruction earlier if it points to a conditional branch and MBB has > 1 instruction
+            if (InsertPos != TargetMBB->end() && InsertPos->isConditionalBranch() && InsertPos != TargetMBB->begin()) {
+              --InsertPos;
+              DBG(6, dbgs() << "  Adjusted InsertPos: moved one instruction earlier due to conditional branch\n");
+            }
             TII->insertNoop(*TargetMBB, InsertPos);
             // TODO: > remove function name in debug print. Instead, if the MBB belongs to a loop, print its info invoking debugPrintLoopInfo.
             DBG(5, {
@@ -1367,41 +1412,4 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
   } // for FuncStartOffset
 
   return MadeChanges;
-}
-
-/// Check if a machine instruction is an atomic operation.
-bool LoopUnrollASM::isAtomicInstruction(const MachineInstr &MI) {
-  if (!MI.hasOrderedMemoryRef() && !MI.mayLoadOrStore())
-    return false;
-
-  // Check if this is an atomic operation by looking at the opcode name
-  // or memory operand flags
-  StringRef OpcodeName = TII->getName(MI.getOpcode());
-
-  // Check for exclusive operations (ARM specific)
-  if (OpcodeName.contains_insensitive("ldxr") ||
-      OpcodeName.contains_insensitive("stxr") ||
-      OpcodeName.contains_insensitive("ldaxr") ||
-      OpcodeName.contains_insensitive("stlxr") ||
-      OpcodeName.contains_insensitive("cas") ||
-      OpcodeName.contains_insensitive("swp") ||
-      OpcodeName.contains_insensitive("ldadd") ||
-      OpcodeName.contains_insensitive("ldclr") ||
-      OpcodeName.contains_insensitive("ldeor") ||
-      OpcodeName.contains_insensitive("ldset")) {
-    return true;
-  }
-
-  // Also check memory operands for atomic flags
-  for (MachineMemOperand *MMO : MI.memoperands()) {
-    if (MMO->isAtomic()) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-FunctionPass *llvm::createLoopUnrollASMPass() {
-  return new LoopUnrollASM();
 }
