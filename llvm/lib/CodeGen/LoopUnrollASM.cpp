@@ -62,22 +62,28 @@ static cl::opt<unsigned> LoopUnrollASMDebug(
   } \
 } while(0)
 
-// DBG_SKIP macro for simple skipping messages - calls DBG with level 3 and adds "  skipping: " prefix
-#define DBG_SKIP(str) do { \
-  DBG(3, dbgs() << "  skipping: " << str << "\n"); \
-} while(0)
-
 // DBG_OBSERVED macro for instruction observations - calls DBG with level 7 and adds "    Observed " prefix
-#define DBG_OBSERVED(str, opcode) do { \
-  DBG(7, dbgs() << "    Observed " << str << ": " << opcode << "\n"); \
-} while(0)
+#define DBG_OBSERVED(str, opcode) DBG(7, dbgs() << "    Observed " << str << ": " << opcode << "\n");
 
-// DO_SKIP macro for complete skip pattern - increments statistic, logs skip message, and returns Changed
-#define DO_SKIP(suffix) { \
+// DBG_SKIP macro for simple skipping messages - calls DBG with level 3 and adds "  skipping: " prefix
+#define DBG_SKIP(str) DBG(3, dbgs() << "  skipping: " << str << "\n");
+
+// Helper macros to detect if optional parameter is provided
+#define GET_MACRO(_1, _2, NAME, ...) NAME
+#define DO_SKIP_1(suffix) { \
   ++NumInnerLoops##suffix; \
   DBG_SKIP(#suffix); \
   return Changed; \
 }
+#define DO_SKIP_2(suffix, msg) { \
+  ++NumInnerLoops##suffix; \
+  DBG(3, dbgs() << "  skipping: " << #suffix << " " << msg << "\n"); \
+  return Changed; \
+}
+
+// DO_SKIP macro for complete skip pattern - increments statistic, logs skip message, and returns Changed
+// Optional second parameter for additional details concatenated to the skip message
+#define DO_SKIP(...) GET_MACRO(__VA_ARGS__, DO_SKIP_2, DO_SKIP_1)(__VA_ARGS__)
 
 // totals
 STATISTIC(NumLoopsDetected, "Number of tight loops detected by LoopUnrollASM");
@@ -99,6 +105,7 @@ STATISTIC(NumInnerLoopsBranchConditionalNoBackedge, "Number of inner loops skipp
 STATISTIC(NumInnerLoopsHasAtomicOps, "Number of inner loops skipped (has atomic ops)");
 STATISTIC(NumInnerLoopsHasInternalBranch, "Number of inner loops skipped (has internal branch)");
 STATISTIC(NumInnerLoopsHasMadd, "Number of inner loops skipped (has MADD inst)");
+STATISTIC(NumInnerLoopsHasVectorByElement, "Number of inner loops skipped (has vector load/store by-element)");
 STATISTIC(NumInnerLoopsTooManyBlocks, "Number of inner loops skipped (too many blocks)");
 STATISTIC(NumInnerLoopsTooManyInsts, "Number of inner loops skipped (too many instructions)");
 STATISTIC(NumInnerLoopsBranchPrepFailure, "Number of loops skipped (branch analysis or condition inversion failed)");
@@ -589,11 +596,9 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   ++NumInnermostLoops;
 
   // Skip loops with too many basic blocks
-  if (Loop->getNumBlocks() > LoopUnrollASMMaxBlocks) {
-    ++NumInnerLoopsTooManyBlocks;
-    DBG(4, dbgs() << "  skipping: Too many blocks (" << Loop->getNumBlocks() << " > " << LoopUnrollASMMaxBlocks << ")\n");
-    return Changed;
-  }
+  // TODO: count loop with internal branches that create short paths
+  if (Loop->getNumBlocks() > LoopUnrollASMMaxBlocks)
+    DO_SKIP(TooManyBlocks, "(" << Loop->getNumBlocks() << " > " << LoopUnrollASMMaxBlocks << ")");
 
   // Count instructions in the loop and check for internal branches
   // We want to skip loops that have branches within the loop body
@@ -653,7 +658,6 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       else if (startsWithAny({"MADD", "SMADD", "UMADD"}) && !OpcodeName.starts_with("FMADD")) {
         // Integer multiply-add has additional overhead
         ++LoopCount;
-        DBG_OBSERVED("integer MADD instruction", OpcodeName);
         if (OpcodeName.starts_with("MADD"))
           DO_SKIP(HasMadd);
       }
@@ -675,6 +679,10 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       // Check for atomic operations
       if (isAtomicInstruction(MI))
         DO_SKIP(HasAtomicOps);
+
+      // Check for vector load/store by-element instructions (LD1, LD2, LD3, LD4, ST1, ST2, ST3, ST4)
+      if (startsWithAny({"LD1", "LD2", "LD3", "LD4", "ST1", "ST2", "ST3", "ST4"}))
+        DO_SKIP(HasVectorByElement);
 
       // Track previous instruction for fusion detection
       PrevInst = &MI;
