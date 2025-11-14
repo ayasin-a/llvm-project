@@ -220,8 +220,8 @@ private:
   void duplicateLoopBody(MachineLoop *Loop, unsigned UnrollFactor,
                          const BackedgeInfo &Backedge);
   bool analyzeMachineInsts(MachineFunction &MF);
-  void insertAlignmentNOP(MachineFunction &MF, MachineBasicBlock &MBB,
-                          MachineBasicBlock *PrevIteratedMBB);
+  MachineLoop* insertAlignmentNOP(MachineFunction &MF, MachineBasicBlock &MBB,
+                                  MachineBasicBlock *PrevIteratedMBB);
   bool isAtomicInstruction(const MachineInstr &MI);
 };
 } // end anonymous namespace
@@ -1012,7 +1012,7 @@ unsigned LoopUnrollASM::findBestUnrollCount(unsigned LoopCount,
     }
 
     // Stop if we've eliminated most bubbles
-    if (NewBubbles < LoopUnrollASMMinBubbles)
+    if (NewBubbles < LoopUnrollASMMinBubbles && (LoopCount > 4 || UC > 2))
       break;
 
     ++UC;
@@ -1271,8 +1271,18 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
 /// Insert a NOP to fix FCMP+FCSEL cacheline crossing alignment issues.
 /// This function handles the complete process of determining the optimal insertion
 /// point and placing the NOP with loop-aware placement logic.
-void LoopUnrollASM::insertAlignmentNOP(MachineFunction &MF, MachineBasicBlock &MBB,
-                                       MachineBasicBlock *PrevIteratedMBB) {
+/// Returns the innermost loop if a NOP was inserted, nullptr otherwise.
+MachineLoop* LoopUnrollASM::insertAlignmentNOP(MachineFunction &MF, MachineBasicBlock &MBB,
+                                               MachineBasicBlock *PrevIteratedMBB) {
+  // Get the innermost loop for this MBB (if any)
+  MachineLoop *CurrentLoop = MLI->getLoopFor(&MBB);
+  MachineLoop *InnermostLoop = nullptr;
+  if (CurrentLoop) {
+    InnermostLoop = CurrentLoop;
+    while (!InnermostLoop->getSubLoops().empty()) {
+      InnermostLoop = InnermostLoop->getSubLoops().front();
+    }
+  }
   // Insert NOP immediately and adjust CurrentOffset for this FuncStartOffset
   // insert at the end of the previous MBB in layout order, if any
   MachineBasicBlock *TargetMBB = PrevIteratedMBB ? PrevIteratedMBB : &*MF.begin();
@@ -1324,6 +1334,9 @@ void LoopUnrollASM::insertAlignmentNOP(MachineFunction &MF, MachineBasicBlock &M
   });
   ++NumAlignNOPsInserted;
   ++NumAddedInsts;
+
+  // Return the innermost loop if we inserted a NOP in a loop, nullptr otherwise
+  return InnermostLoop;
 }
 
 bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
@@ -1366,6 +1379,7 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
     unsigned CurrentOffset = 0;
     MachineInstr* PrevInstr = nullptr;
     MachineBasicBlock* PrevIteratedMBB = nullptr; // Track previous MBB in iteration order
+    MachineLoop* HandledLoop = nullptr; // Track which loop already had a NOP inserted
 
     for (MachineBasicBlock &MBB : MF) {
       // Skip blocks that are not in innermost loops if LoopUnrollASMAlignAll is off
@@ -1420,11 +1434,22 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
                 dbgs() << "    " << *NextI;
             });
 
-            insertAlignmentNOP(MF, MBB, PrevIteratedMBB);
-            MadeChanges = true;
+            // Check if current MBB belongs to already handled loop
+            MachineLoop *CurrentLoop = MLI->getLoopFor(&MBB);
+            if (!HandledLoop || !CurrentLoop || !CurrentLoop->contains(HandledLoop->getHeader())) {
+              // Either no loop handled yet, or current MBB is in a different loop
+              MachineLoop *NewHandledLoop = insertAlignmentNOP(MF, MBB, PrevIteratedMBB);
+              if (NewHandledLoop) {
+                HandledLoop = NewHandledLoop;
+                DBG(6, dbgs() << "  Handled loop for BB" << MBB.getNumber() << " - will skip future BBs in this loop\n");
+              }
+              MadeChanges = true;
 
-            // Adjust CurrentOffset since NOP affects subsequent calculations in this FuncStartOffset iteration
-            CurrentOffset += 1; // Account for the inserted NOP
+              // Adjust CurrentOffset since NOP affects subsequent calculations in this FuncStartOffset iteration
+              CurrentOffset += 1; // Account for the inserted NOP
+            } else {
+              DBG(6, dbgs() << "  Skipping NOP insertion - BB" << MBB.getNumber() << " belongs to already handled loop\n");
+            }
 
             // Continue to check for more crossings in this function
           }
