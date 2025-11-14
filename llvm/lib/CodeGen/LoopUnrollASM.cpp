@@ -115,6 +115,11 @@ static cl::opt<unsigned> LoopUnrollASMMaxInsts(
     cl::desc("Maximum number of instructions in a loop for LoopUnrollASM to process"),
     cl::init(46), cl::Hidden);
 
+static cl::opt<unsigned> LoopUnrollASMMaxBlocks(
+    "loop-unroll-asm-max-blocks",
+    cl::desc("Maximum number of basic blocks in a loop for LoopUnrollASM to process"),
+    cl::init(8), cl::Hidden);
+
 static cl::opt<float> LoopUnrollASMFetchBubblesThreshold(
     "loop-unroll-asm-fetch-bubbles-threshold",
     cl::desc("Threshold for fetch bubbles ratio to trigger loop unrolling"),
@@ -541,9 +546,9 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   ++NumInnermostLoops;
 
   // Skip loops with too many basic blocks
-  if (Loop->getNumBlocks() > 8) {
+  if (Loop->getNumBlocks() > LoopUnrollASMMaxBlocks) {
     ++NumInnerLoopsTooManyBlocks;
-    DBG(4, dbgs() << "  skipping: Too many blocks (" << Loop->getNumBlocks() << " > 8)\n");
+    DBG(4, dbgs() << "  skipping: Too many blocks (" << Loop->getNumBlocks() << " > " << LoopUnrollASMMaxBlocks << ")\n");
     return Changed;
   }
 
