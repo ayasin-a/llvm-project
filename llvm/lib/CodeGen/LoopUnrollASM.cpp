@@ -220,6 +220,8 @@ private:
   void duplicateLoopBody(MachineLoop *Loop, unsigned UnrollFactor,
                          const BackedgeInfo &Backedge);
   bool analyzeMachineInsts(MachineFunction &MF);
+  void insertAlignmentNOP(MachineFunction &MF, MachineBasicBlock &MBB,
+                          MachineBasicBlock *PrevIteratedMBB);
   bool isAtomicInstruction(const MachineInstr &MI);
 };
 } // end anonymous namespace
@@ -1266,6 +1268,64 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   }
 }
 
+/// Insert a NOP to fix FCMP+FCSEL cacheline crossing alignment issues.
+/// This function handles the complete process of determining the optimal insertion
+/// point and placing the NOP with loop-aware placement logic.
+void LoopUnrollASM::insertAlignmentNOP(MachineFunction &MF, MachineBasicBlock &MBB,
+                                       MachineBasicBlock *PrevIteratedMBB) {
+  // Insert NOP immediately and adjust CurrentOffset for this FuncStartOffset
+  // insert at the end of the previous MBB in layout order, if any
+  MachineBasicBlock *TargetMBB = PrevIteratedMBB ? PrevIteratedMBB : &*MF.begin();
+
+  // If current MBB belongs to an innermost loop and PrevIteratedMBB belongs to the same loop,
+  // keep going backward until first MBB outside that loop or MF.begin()
+  if (PrevIteratedMBB) {
+    MachineLoop *CurrentLoop = MLI->getLoopFor(&MBB);
+    if (CurrentLoop && CurrentLoop->getSubLoops().empty()) { // innermost loop
+      MachineLoop *PrevLoop = MLI->getLoopFor(PrevIteratedMBB);
+      if (PrevLoop == CurrentLoop) { // same loop
+        // Go backward from PrevIteratedMBB until we find MBB outside the loop or reach beginning
+        auto I = MachineFunction::iterator(PrevIteratedMBB);
+        while (I != MF.begin()) {
+          --I;
+          MachineBasicBlock *CandidateMBB = &*I;
+          MachineLoop *CandidateLoop = MLI->getLoopFor(CandidateMBB);
+          if (CandidateLoop != CurrentLoop) {
+            TargetMBB = CandidateMBB;
+            DBG(6, dbgs() << "  Found TargetMBB outside loop: BB" << TargetMBB->getNumber() << "\n");
+            break;
+          }
+        }
+        // If we reached MF.begin(), use it regardless
+        if (I == MF.begin()) {
+          TargetMBB = &*MF.begin();
+          DBG(6, dbgs() << "  Using function start as TargetMBB: BB" << TargetMBB->getNumber() << "\n");
+        }
+      }
+    }
+  }
+  assert(TargetMBB && "TargetMBB should never be null");
+  auto InsertPos = (TargetMBB == &*MF.begin()) ? TargetMBB->begin() : TargetMBB->getFirstTerminator();
+  // Move InsertPos one instruction earlier if it points to a conditional branch and MBB has > 1 instruction
+  if (InsertPos != TargetMBB->end() && InsertPos->isConditionalBranch() && InsertPos != TargetMBB->begin()) {
+    --InsertPos;
+    DBG(6, dbgs() << "  Adjusted InsertPos: moved one instruction earlier due to conditional branch\n");
+  }
+  TII->insertNoop(*TargetMBB, InsertPos);
+  // TODO: > remove function name in debug print. Instead, if the MBB belongs to a loop, print its info invoking debugPrintLoopInfo.
+  DBG(5, {
+    std::string InsertLocation;
+    if (TargetMBB == &*MF.begin()) {
+      InsertLocation = "at start of function (beginning of first MBB)";
+    } else {
+      InsertLocation = "at end of BB" + std::to_string(TargetMBB->getNumber()) + " (before terminators)";
+    }
+    dbgs() << "  Inserting NOP in BB" << TargetMBB->getNumber() << " " << InsertLocation << "\n";
+  });
+  ++NumAlignNOPsInserted;
+  ++NumAddedInsts;
+}
+
 bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
   // Get function alignment information from MachineFunction (actual assembly-level alignment)
   const Function &F = MF.getFunction();
@@ -1354,37 +1414,13 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
               dbgs() << "    " << MI;
               // Find the next real (non-debug, non-pseudo) instruction
               auto NextI = std::next(I);
-              while (NextI != E && (NextI->isDebugInstr() || NextI->isPseudo())) {
+              while (NextI != E && (NextI->isDebugInstr() || NextI->isPseudo()))
                 ++NextI;
-              }
-              if (NextI != E) {
+              if (NextI != E)
                 dbgs() << "    " << *NextI;
-              }
             });
 
-            // Insert NOP immediately and adjust CurrentOffset for this FuncStartOffset
-            // insert at the end of the previous MBB in layout order, if any
-            MachineBasicBlock *TargetMBB = PrevIteratedMBB ? PrevIteratedMBB : &*MF.begin();
-            assert(TargetMBB && "TargetMBB should never be null");
-            auto InsertPos = (TargetMBB == PrevIteratedMBB) ? TargetMBB->getFirstTerminator() : TargetMBB->begin();
-            // Move InsertPos one instruction earlier if it points to a conditional branch and MBB has > 1 instruction
-            if (InsertPos != TargetMBB->end() && InsertPos->isConditionalBranch() && InsertPos != TargetMBB->begin()) {
-              --InsertPos;
-              DBG(6, dbgs() << "  Adjusted InsertPos: moved one instruction earlier due to conditional branch\n");
-            }
-            TII->insertNoop(*TargetMBB, InsertPos);
-            // TODO: > remove function name in debug print. Instead, if the MBB belongs to a loop, print its info invoking debugPrintLoopInfo.
-            DBG(5, {
-              std::string InsertLocation;
-              if (PrevIteratedMBB) {
-                InsertLocation = "at end of previous BB" + PrevIteratedMBB->getName().str() + " (before terminators)";
-              } else {
-                InsertLocation = "at start of function (beginning of first MBB)";
-              }
-              dbgs() << "  Inserting NOP in BB" << TargetMBB->getNumber() << " " << InsertLocation << "\n";
-            });
-            ++NumAlignNOPsInserted;
-            ++NumAddedInsts;
+            insertAlignmentNOP(MF, MBB, PrevIteratedMBB);
             MadeChanges = true;
 
             // Adjust CurrentOffset since NOP affects subsequent calculations in this FuncStartOffset iteration
