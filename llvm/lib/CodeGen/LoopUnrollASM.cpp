@@ -106,6 +106,7 @@ STATISTIC(NumInnerLoopsHasAtomicOps, "Number of inner loops skipped (has atomic 
 STATISTIC(NumInnerLoopsHasInternalBranch, "Number of inner loops skipped (has internal branch)");
 STATISTIC(NumInnerLoopsHasMadd, "Number of inner loops skipped (has MADD inst)");
 STATISTIC(NumInnerLoopsHasVectorByElement, "Number of inner loops skipped (has vector load/store by-element)");
+STATISTIC(NumInnerLoopsHasRqsrt, "Number of inner loops skipped (has RQSRT inst)");
 STATISTIC(NumInnerLoopsTooManyBlocks, "Number of inner loops skipped (too many blocks)");
 STATISTIC(NumInnerLoopsTooManyInsts, "Number of inner loops skipped (too many instructions)");
 STATISTIC(NumInnerLoopsBranchPrepFailure, "Number of loops skipped (branch analysis or condition inversion failed)");
@@ -156,6 +157,12 @@ static cl::opt<bool> LoopUnrollASMAlignAll(
     "loop-unroll-asm-align-all",
     cl::desc("Analyze all basic blocks for alignment issues (not just innermost loops)"),
     cl::init(true), cl::Hidden);
+
+static cl::opt<unsigned> LoopUnrollASMSkip(
+    "loop-unroll-asm-skip",
+    cl::desc("Bitmask to control DO_SKIP heuristics "
+             "(bit 0: HasMadd, bit 1: HasVectorByElement, bit 2: HasRqsrt)"),
+    cl::init(0x5), cl::Hidden);
 
 namespace {
 enum TerminatorPattern {
@@ -658,7 +665,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       else if (startsWithAny({"MADD", "SMADD", "UMADD"}) && !OpcodeName.starts_with("FMADD")) {
         // Integer multiply-add has additional overhead
         ++LoopCount;
-        if (OpcodeName.starts_with("MADD"))
+        if (OpcodeName.starts_with("MADD") && (LoopUnrollASMSkip & 0x1))
           DO_SKIP(HasMadd);
       }
       // Check for Synchronization Barrier instructions
@@ -681,8 +688,12 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         DO_SKIP(HasAtomicOps);
 
       // Check for vector load/store by-element instructions (LD1, LD2, LD3, LD4, ST1, ST2, ST3, ST4)
-      if (startsWithAny({"LD1", "LD2", "LD3", "LD4", "ST1", "ST2", "ST3", "ST4"}))
+      if (startsWithAny({"LD1", "LD2", "LD3", "LD4", "ST1", "ST2", "ST3", "ST4"}) && (LoopUnrollASMSkip & 0x2))
         DO_SKIP(HasVectorByElement);
+
+      // Check for RQSRT (Reciprocal Square Root) instructions
+      if (OpcodeName.contains_insensitive("rqsrt") && (LoopUnrollASMSkip & 0x4))
+        DO_SKIP(HasRqsrt);
 
       // Track previous instruction for fusion detection
       PrevInst = &MI;
