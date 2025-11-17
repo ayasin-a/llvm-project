@@ -106,7 +106,7 @@ STATISTIC(NumInnerLoopsHasAtomicOps, "Number of inner loops skipped (has atomic 
 STATISTIC(NumInnerLoopsHasInternalBranch, "Number of inner loops skipped (has internal branch)");
 STATISTIC(NumInnerLoopsHasMadd, "Number of inner loops skipped (has MADD inst)");
 STATISTIC(NumInnerLoopsHasVectorByElement, "Number of inner loops skipped (has vector load/store by-element)");
-STATISTIC(NumInnerLoopsHasRqsrt, "Number of inner loops skipped (has RQSRT inst)");
+STATISTIC(NumInnerLoopsHasRsqrt, "Number of inner loops skipped (has RQSRT inst)");
 STATISTIC(NumInnerLoopsTooManyBlocks, "Number of inner loops skipped (too many blocks)");
 STATISTIC(NumInnerLoopsTooManyInsts, "Number of inner loops skipped (too many instructions)");
 STATISTIC(NumInnerLoopsBranchPrepFailure, "Number of loops skipped (branch analysis or condition inversion failed)");
@@ -161,7 +161,7 @@ static cl::opt<bool> LoopUnrollASMAlignAll(
 static cl::opt<unsigned> LoopUnrollASMSkip(
     "loop-unroll-asm-skip",
     cl::desc("Bitmask to control DO_SKIP heuristics "
-             "(bit 0: HasMadd, bit 1: HasVectorByElement, bit 2: HasRqsrt)"),
+             "(bit 0: HasMadd, bit 1: HasVectorByElement, bit 2: HasRsqrt)"),
     cl::init(0x5), cl::Hidden);
 
 namespace {
@@ -692,8 +692,8 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         DO_SKIP(HasVectorByElement);
 
       // Check for RQSRT (Reciprocal Square Root) instructions
-      if (OpcodeName.contains_insensitive("rqsrt") && (LoopUnrollASMSkip & 0x4))
-        DO_SKIP(HasRqsrt);
+      if (OpcodeName.contains_insensitive("rsqrt") && (LoopUnrollASMSkip & 0x4))
+        DO_SKIP(HasRsqrt);
 
       // Track previous instruction for fusion detection
       PrevInst = &MI;
