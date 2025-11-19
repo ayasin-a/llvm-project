@@ -39,6 +39,24 @@ using namespace llvm;
 
 #define DEBUG_TYPE "loop-unroll-asm"
 
+static cl::opt<bool> LoopUnrollASMAlign(
+    "loop-unroll-asm-align",
+    cl::desc("Enable alignment-specific analysis"),
+    cl::init(true), cl::Hidden);
+
+static cl::opt<bool> LoopUnrollASMAlignAll(
+    "loop-unroll-asm-align-all",
+    cl::desc("Analyze all basic blocks for alignment issues (not just innermost loops)"),
+    cl::init(true), cl::Hidden);
+
+static cl::opt<int> LoopUnrollASMAlignThreshold(
+    "loop-unroll-asm-align-threshold",
+    cl::desc("Threshold for 64-byte alignment of unrolled loops (0-15: bubble threshold, -1: disable alignment)"),
+    cl::init(3), cl::Hidden,
+    cl::callback([](const int &Val) {
+      if (Val < -1 || Val > 15)report_fatal_error("loop-unroll-asm-align-threshold must be -1 or in range [0, 15]");
+    }));
+
 static cl::opt<unsigned> LoopUnrollASMDebug(
     "loop-unroll-asm-debug",
     cl::desc("Debug level for loop unroll asm pass"),
@@ -56,6 +74,42 @@ static cl::opt<unsigned> LoopUnrollASMDebug(
 //    - Level 8: Per-instruction low-level (e.g., detailed offset calculations, per-instruction details)
 //    - Level 10: detailed debug.
 // DBG macro that takes level as first parameter
+
+static cl::opt<unsigned> LoopUnrollASMEnable(
+    "loop-unroll-asm-enable",
+    cl::desc("Bitmask to enable each pattern in LoopUnrollASM "
+             "(bit 0: One_Backedge, bit 1: Two_Backedge_Uncond, bit 2: Multi_CondExit_Backedge)"),
+    cl::init(0x3), cl::Hidden);
+
+static cl::opt<float> LoopUnrollASMFetchBubblesThreshold(
+    "loop-unroll-asm-fetch-bubbles-threshold",
+    cl::desc("Threshold for fetch bubbles ratio to trigger loop unrolling"),
+    cl::init(0.20f), cl::Hidden);
+
+static cl::opt<unsigned> LoopUnrollASMMaxBlocks(
+    "loop-unroll-asm-max-blocks",
+    cl::desc("Maximum number of basic blocks in a loop for LoopUnrollASM to process"),
+    cl::init(8), cl::Hidden);
+
+static cl::opt<unsigned> LoopUnrollASMMaxOps(
+    "loop-unroll-asm-max-ops",
+    cl::desc("Maximum number of operations in a loop for LoopUnrollASM to process"),
+    cl::init(46), cl::Hidden);
+
+static cl::opt<unsigned> LoopUnrollASMMinBubbles(
+    "loop-unroll-asm-min-bubbles",
+    cl::desc("Minimum number of bubbles to continue searching for better unroll count"),
+    cl::init(3), cl::Hidden,
+    cl::callback([](const unsigned &Val) {
+      if (Val == 0) report_fatal_error("loop-unroll-asm-min-bubbles must be at least 1");
+    }));
+
+static cl::opt<unsigned> LoopUnrollASMSkip(
+    "loop-unroll-asm-skip",
+    cl::desc("Bitmask to control DO_SKIP heuristics "
+             "(bit 0: HasMadd, bit 1: HasVectorByElement, bit 2: HasRsqrt)"),
+    cl::init(0x1), cl::Hidden);
+
 #define DBG(level, ...) do { \
   if (level <= LoopUnrollASMDebug) { \
     LLVM_DEBUG(__VA_ARGS__); \
@@ -120,51 +174,6 @@ STATISTIC(NumInnerLoops_LastInstNotBranch, "Number of inner loops where last ins
 STATISTIC(NumAlignMBBsSkippedNotInnermost, "Number of MBBs skipped (not in innermost loop)");
 STATISTIC(NumAlignNOPsInserted, "Number of NOPs inserted for FCMP+FCSEL cacheline crossings");
 
-static cl::opt<unsigned> LoopUnrollASMMaxInsts(
-    "loop-unroll-asm-max-insts",
-    cl::desc("Maximum number of instructions in a loop for LoopUnrollASM to process"),
-    cl::init(46), cl::Hidden);
-
-static cl::opt<unsigned> LoopUnrollASMMaxBlocks(
-    "loop-unroll-asm-max-blocks",
-    cl::desc("Maximum number of basic blocks in a loop for LoopUnrollASM to process"),
-    cl::init(8), cl::Hidden);
-
-static cl::opt<float> LoopUnrollASMFetchBubblesThreshold(
-    "loop-unroll-asm-fetch-bubbles-threshold",
-    cl::desc("Threshold for fetch bubbles ratio to trigger loop unrolling"),
-    cl::init(0.20f), cl::Hidden);
-
-static cl::opt<unsigned> LoopUnrollASMEnable(
-    "loop-unroll-asm-enable",
-    cl::desc("Bitmask to enable each pattern in LoopUnrollASM "
-             "(bit 0: One_Backedge, bit 1: Two_Backedge_Uncond, bit 2: Multi_CondExit_Backedge)"),
-    cl::init(0x3), cl::Hidden);
-
-static cl::opt<unsigned> LoopUnrollASMMinBubbles(
-    "loop-unroll-asm-min-bubbles",
-    cl::desc("Minimum number of bubbles to continue searching for better unroll count"),
-    cl::init(3), cl::Hidden,
-    cl::callback([](const unsigned &Val) {
-      if (Val == 0) report_fatal_error("loop-unroll-asm-min-bubbles must be at least 1");
-    }));
-
-static cl::opt<bool> LoopUnrollASMAlign(
-    "loop-unroll-asm-align",
-    cl::desc("Enable alignment-specific analysis"),
-    cl::init(true), cl::Hidden);
-
-static cl::opt<bool> LoopUnrollASMAlignAll(
-    "loop-unroll-asm-align-all",
-    cl::desc("Analyze all basic blocks for alignment issues (not just innermost loops)"),
-    cl::init(true), cl::Hidden);
-
-static cl::opt<unsigned> LoopUnrollASMSkip(
-    "loop-unroll-asm-skip",
-    cl::desc("Bitmask to control DO_SKIP heuristics "
-             "(bit 0: HasMadd, bit 1: HasVectorByElement, bit 2: HasRsqrt)"),
-    cl::init(0x1), cl::Hidden);
-
 namespace {
 enum TerminatorPattern {
   Nonsupported = 0,
@@ -214,9 +223,9 @@ private:
   static constexpr unsigned MachineWidth = 10;
 
   // Static helper function to calculate bubbles
-  static unsigned calculateBubbles(unsigned LoopCount) {
-    unsigned Remainder = LoopCount % MachineWidth;
-    return Remainder ? MachineWidth - Remainder : 0;
+  static inline unsigned calculateBubbles(unsigned LoopCount, unsigned Size) {
+    unsigned Remainder = LoopCount % Size;
+    return Remainder ? Size - Remainder : 0;
   }
 
   bool isCompareBranchFusion(const MachineInstr *CompareInst,
@@ -871,9 +880,9 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   if (!InternalBranches.empty())
     DO_SKIP(HasInternalBranch);
 
-  if (LoopCount >= LoopUnrollASMMaxInsts) {
+  if (LoopCount >= LoopUnrollASMMaxOps) {
     ++NumInnerLoopsTooManyInsts;
-    DBG(4, dbgs() << "  skipping: Too many instructions (" << LoopCount << " >= " << LoopUnrollASMMaxInsts << ")\n");
+     DBG(4, dbgs() << "  skipping: Too many instructions (" << LoopCount << " >= " << LoopUnrollASMMaxOps << ")\n");
     return Changed;
   }
 
@@ -946,8 +955,7 @@ void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
 
 // processTightLoop() targets certain loops that meet these conditions:
 // - Are Inner-most loops
-// - Have less than N instructions (default 46, configurable via
-// -loop-unroll-asm-max-insts)
+// - Have less than N instructions (default 46, configurable via -loop-unroll-asm-max-ops)
 // - Are single basic-block loops (Head == Latch)
 // - Have a conditional branch as the backedge
 // - Loop body has no control flow instructions (branches/calls/returns)
@@ -961,7 +969,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
   const unsigned LoopCycles =
       (LoopCount + MachineWidth - 1) / MachineWidth; // round-up int divide
 
-  unsigned Bubbles = calculateBubbles(LoopCount);
+  unsigned Bubbles = calculateBubbles(LoopCount, MachineWidth);
   // Hanlde the case if the loop would possibly induce +20% Frontend Bound
   if (Bubbles / float(MachineWidth * LoopCycles) > LoopUnrollASMFetchBubblesThreshold) {
     // First, we need to analyze the loop branch to see if we can invert it
@@ -990,8 +998,7 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
       return false;
     }
 
-
-    // Count simple instructions (no fusion logic)
+    // Count # instructions in loop
     unsigned LoopInsts = 0;
     for (MachineBasicBlock *MBB : Loop->blocks())
       for (MachineInstr &MI : *MBB)
@@ -1002,11 +1009,17 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
       dbgs() << "  with Loop count: " << LoopCount << " for " << LoopInsts << " instructions\n";});
     unsigned UC = findBestUnrollCount(LoopCount, Bubbles);
     MachineBasicBlock *FirstLoopBlock = duplicateLoopBody(Loop, UC, Backedge);
-    if (Backedge.Pattern == One_Backedge && (LoopInsts * UC) % 16 == 0 && FirstLoopBlock) {
+
+    LoopInsts = Backedge.Pattern == Two_Backedge_Uncond ? LoopInsts - 1 : LoopInsts;
+    if (LoopUnrollASMAlignThreshold >= 0 &&
+        calculateBubbles(LoopInsts*UC, 16) <= (unsigned)LoopUnrollASMAlignThreshold) {
+      assert(FirstLoopBlock || "FirstLoopBlock must be valid");
       FirstLoopBlock->setAlignment(Align(64));
       ++NumLoopsUnrolledAndAligned;
-      DBG(4, dbgs() << "  Set 64-byte alignment for BB" << FirstLoopBlock->getNumber() << "\n");
+      DBG(4, dbgs() << "  Set 64-byte alignment for BB" << FirstLoopBlock->getNumber()
+        << " unrolling left " << 4*calculateBubbles(LoopInsts*UC, 16) << " bytes\n");
     }
+
     NumAddedInsts += (UC - 1) * LoopInsts;
     ++NumLoopsUnrolled;
     if (Backedge.Pattern == Two_Backedge_Uncond) {
@@ -1036,7 +1049,7 @@ unsigned LoopUnrollASM::findBestUnrollCount(unsigned LoopCount,
       break;
 
     // Calculate new bubbles for this unroll count
-    unsigned NewBubbles = calculateBubbles(NewLoopCount);
+    unsigned NewBubbles = calculateBubbles(NewLoopCount, MachineWidth);
     // Update best unroll count if we found fewer bubbles
     if (NewBubbles < Bubbles) {
       DBG(10, dbgs() << "     findBestUnrollCount: Bubbles=" << Bubbles << " NewBubbles=" << NewBubbles << " UC=" << UC << "\n");
