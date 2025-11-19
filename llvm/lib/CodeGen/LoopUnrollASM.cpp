@@ -83,13 +83,14 @@ static cl::opt<unsigned> LoopUnrollASMDebug(
 
 // DO_SKIP macro for complete skip pattern - increments statistic, logs skip message, and returns Changed
 // Optional second parameter for additional details concatenated to the skip message
-#define DO_SKIP(...) GET_MACRO(__VA_ARGS__, DO_SKIP_2, DO_SKIP_1)(__VA_ARGS__)
+#define DO_SKIP(...) GET_MACRO(__VA_ARGS__, DO_SKIP_2, DO_SKIP_1, )(__VA_ARGS__)
 
 // totals
 STATISTIC(NumLoopsDetected, "Number of tight loops detected by LoopUnrollASM");
 STATISTIC(NumLoopsUnrolled, "Number of tight loops unrolled by LoopUnrollASM");
 STATISTIC(NumLoopsUnrolledCondUncond, "Number of tight loops unrolled with cond+uncond terminators");
 STATISTIC(NumLoopsUnrolledMultiCondExit, "Number of tight loops unrolled with multi-cond-exit+backedge pattern");
+STATISTIC(NumLoopsUnrolledAndAligned, "Number of loops unrolled and aligned to 64 bytes");
 STATISTIC(NumLoopsNotEnoughBubbles, "Number of tight loops skipped (not enough bubbles)");
 STATISTIC(NumAddedInsts, "Number of added instruction by loop-unroll-asm pass");
 STATISTIC(NumInnermostLoops, "Number of inner-most loops");
@@ -162,7 +163,7 @@ static cl::opt<unsigned> LoopUnrollASMSkip(
     "loop-unroll-asm-skip",
     cl::desc("Bitmask to control DO_SKIP heuristics "
              "(bit 0: HasMadd, bit 1: HasVectorByElement, bit 2: HasRsqrt)"),
-    cl::init(0x5), cl::Hidden);
+    cl::init(0x1), cl::Hidden);
 
 namespace {
 enum TerminatorPattern {
@@ -231,7 +232,7 @@ private:
                         MachineBasicBlock *Header, unsigned LoopCount,
                         BackedgeInfo &Backedge);
   unsigned findBestUnrollCount(unsigned LoopCount, unsigned Bubbles);
-  void duplicateLoopBody(MachineLoop *Loop, unsigned UnrollFactor,
+  MachineBasicBlock* duplicateLoopBody(MachineLoop *Loop, unsigned UnrollFactor,
                          const BackedgeInfo &Backedge);
   bool analyzeMachineInsts(MachineFunction &MF);
   MachineLoop* insertAlignmentNOP(MachineFunction &MF, MachineBasicBlock &MBB,
@@ -989,11 +990,24 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
       return false;
     }
 
+
+    // Count simple instructions (no fusion logic)
+    unsigned LoopInsts = 0;
+    for (MachineBasicBlock *MBB : Loop->blocks())
+      for (MachineInstr &MI : *MBB)
+        if (!MI.isDebugInstr() && !MI.isPseudo())
+          ++LoopInsts;
+    
     DBG(3, {debugPrintLoopInfo(MF, Loop, " Found qualifying", Backedge.ExitBlock);
-      dbgs() << "  with Loop count: " << LoopCount << "\n";});
+      dbgs() << "  with Loop count: " << LoopCount << " for " << LoopInsts << " instructions\n";});
     unsigned UC = findBestUnrollCount(LoopCount, Bubbles);
-    duplicateLoopBody(Loop, UC, Backedge);
-    NumAddedInsts += (UC - 1) * LoopCount;
+    MachineBasicBlock *FirstLoopBlock = duplicateLoopBody(Loop, UC, Backedge);
+    if (Backedge.Pattern == One_Backedge && (LoopInsts * UC) % 16 == 0 && FirstLoopBlock) {
+      FirstLoopBlock->setAlignment(Align(64));
+      ++NumLoopsUnrolledAndAligned;
+      DBG(4, dbgs() << "  Set 64-byte alignment for BB" << FirstLoopBlock->getNumber() << "\n");
+    }
+    NumAddedInsts += (UC - 1) * LoopInsts;
     ++NumLoopsUnrolled;
     if (Backedge.Pattern == Two_Backedge_Uncond) {
       ++NumLoopsUnrolledCondUncond;
@@ -1040,7 +1054,7 @@ unsigned LoopUnrollASM::findBestUnrollCount(unsigned LoopCount,
   return BestUC;
 }
 
-void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
+MachineBasicBlock* LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
                                       unsigned UnrollFactor,
                                       const BackedgeInfo &Backedge) {
   assert (UnrollFactor > 1);
@@ -1285,6 +1299,9 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
 
     assert(false && "Instruction count mismatch after loop unrolling");
   }
+
+  // Return the first loop block in layout order
+  return LoopBlocksInOrder.empty() ? nullptr : LoopBlocksInOrder[0];
 }
 
 /// Insert a NOP to fix FCMP+FCSEL cacheline crossing alignment issues.
