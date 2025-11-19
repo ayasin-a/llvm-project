@@ -49,6 +49,11 @@ static cl::opt<bool> LoopUnrollASMAlignAll(
     cl::desc("Analyze all basic blocks for alignment issues (not just innermost loops)"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> LoopUnrollASMAlignByNop(
+    "loop-unroll-asm-align-by-nop",
+    cl::desc("Enable alignment via inserting NOPs"),
+    cl::init(true), cl::Hidden);
+
 static cl::opt<int> LoopUnrollASMAlignThreshold(
     "loop-unroll-asm-align-threshold",
     cl::desc("Threshold for 64-byte alignment of unrolled loops (0-15: bubble threshold, -1: disable alignment)"),
@@ -173,6 +178,11 @@ STATISTIC(NumInnerLoops_LastInstNotBranch, "Number of inner loops where last ins
 // alignment pass
 STATISTIC(NumAlignMBBsSkippedNotInnermost, "Number of MBBs skipped (not in innermost loop)");
 STATISTIC(NumAlignNOPsInserted, "Number of NOPs inserted for FCMP+FCSEL cacheline crossings");
+STATISTIC(NumInnermostLoopsAlign8, "Number of innermost loops with 8-byte alignment");
+STATISTIC(NumInnermostLoopsAlign16, "Number of innermost loops with 16-byte alignment");
+STATISTIC(NumInnermostLoopsAlign32, "Number of innermost loops with 32-byte alignment");
+STATISTIC(NumInnermostLoopsAlign64, "Number of innermost loops with 64-byte alignment");
+STATISTIC(NumInnermostLoopsAlignOther, "Number of innermost loops with other alignment");
 
 namespace {
 enum TerminatorPattern {
@@ -241,8 +251,10 @@ private:
                         MachineBasicBlock *Header, unsigned LoopCount,
                         BackedgeInfo &Backedge);
   unsigned findBestUnrollCount(unsigned LoopCount, unsigned Bubbles);
-  MachineBasicBlock* duplicateLoopBody(MachineLoop *Loop, unsigned UnrollFactor,
+  void duplicateLoopBody(MachineLoop *Loop, unsigned UnrollFactor,
                          const BackedgeInfo &Backedge);
+  unsigned countLoopInstructions(const MachineLoop *Loop);
+  bool areLoopBlocksContiguous(const MachineLoop *Loop);
   bool analyzeMachineInsts(MachineFunction &MF);
   MachineLoop* insertAlignmentNOP(MachineFunction &MF, MachineBasicBlock &MBB,
                                   MachineBasicBlock *PrevIteratedMBB);
@@ -596,6 +608,7 @@ bool LoopUnrollASM::isLoopSimplifyForm(const MachineLoop *Loop) {
   return true;
 }
 
+  // First pass: handles loop-unrolling
 bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   // Process inner loops first (depth-first)
   bool Changed = false;
@@ -998,28 +1011,13 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
       return false;
     }
 
-    // Count # instructions in loop
-    unsigned LoopInsts = 0;
-    for (MachineBasicBlock *MBB : Loop->blocks())
-      for (MachineInstr &MI : *MBB)
-        if (!MI.isDebugInstr() && !MI.isPseudo())
-          ++LoopInsts;
-    
+    unsigned LoopInsts = countLoopInstructions(Loop);
     DBG(3, {debugPrintLoopInfo(MF, Loop, " Found qualifying", Backedge.ExitBlock);
       dbgs() << "  with Loop count: " << LoopCount << " for " << LoopInsts << " instructions\n";});
     unsigned UC = findBestUnrollCount(LoopCount, Bubbles);
-    MachineBasicBlock *FirstLoopBlock = duplicateLoopBody(Loop, UC, Backedge);
+    duplicateLoopBody(Loop, UC, Backedge);
 
     LoopInsts = Backedge.Pattern == Two_Backedge_Uncond ? LoopInsts - 1 : LoopInsts;
-    if (LoopUnrollASMAlignThreshold >= 0 &&
-        calculateBubbles(LoopInsts*UC, 16) <= (unsigned)LoopUnrollASMAlignThreshold) {
-      assert(FirstLoopBlock || "FirstLoopBlock must be valid");
-      FirstLoopBlock->setAlignment(Align(64));
-      ++NumLoopsUnrolledAndAligned;
-      DBG(4, dbgs() << "  Set 64-byte alignment for BB" << FirstLoopBlock->getNumber()
-        << " unrolling left " << 4*calculateBubbles(LoopInsts*UC, 16) << " bytes\n");
-    }
-
     NumAddedInsts += (UC - 1) * LoopInsts;
     ++NumLoopsUnrolled;
     if (Backedge.Pattern == Two_Backedge_Uncond) {
@@ -1067,7 +1065,7 @@ unsigned LoopUnrollASM::findBestUnrollCount(unsigned LoopCount,
   return BestUC;
 }
 
-MachineBasicBlock* LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
+void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
                                       unsigned UnrollFactor,
                                       const BackedgeInfo &Backedge) {
   assert (UnrollFactor > 1);
@@ -1312,9 +1310,57 @@ MachineBasicBlock* LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
 
     assert(false && "Instruction count mismatch after loop unrolling");
   }
+}
 
-  // Return the first loop block in layout order
-  return LoopBlocksInOrder.empty() ? nullptr : LoopBlocksInOrder[0];
+unsigned LoopUnrollASM::countLoopInstructions(const MachineLoop *Loop) {
+  // Count # instructions in loop
+  unsigned LoopInsts = 0;
+  for (MachineBasicBlock *MBB : Loop->blocks())
+    for (MachineInstr &MI : *MBB)
+      if (!MI.isDebugInstr() && !MI.isPseudo())
+        ++LoopInsts;
+  return LoopInsts;
+}
+
+bool LoopUnrollASM::areLoopBlocksContiguous(const MachineLoop *Loop) {
+  if (Loop->blocks().empty())
+    return true;
+
+  MachineFunction *MF = Loop->getHeader()->getParent();
+
+  // Find the first and last loop blocks in layout order
+  MachineBasicBlock *FirstLoopBlock = nullptr;
+  MachineBasicBlock *LastLoopBlock = nullptr;
+
+  for (MachineBasicBlock &MBB : *MF) {
+    if (Loop->contains(&MBB)) {
+      if (!FirstLoopBlock)
+        FirstLoopBlock = &MBB;
+      LastLoopBlock = &MBB;
+    }
+  }
+
+  if (!FirstLoopBlock || !LastLoopBlock)
+    return false;
+
+  // Count blocks between first and last (inclusive)
+  unsigned BlocksInRange = 0;
+  bool InRange = false;
+
+  for (MachineBasicBlock &MBB : *MF) {
+    if (&MBB == FirstLoopBlock)
+      InRange = true;
+
+    if (InRange) {
+      ++BlocksInRange;
+
+      if (&MBB == LastLoopBlock)
+        break;
+    }
+  }
+
+  // Contiguous if the number of blocks in range equals the number of loop blocks
+  return BlocksInRange == Loop->getNumBlocks();
 }
 
 /// Insert a NOP to fix FCMP+FCSEL cacheline crossing alignment issues.
@@ -1388,6 +1434,7 @@ MachineLoop* LoopUnrollASM::insertAlignmentNOP(MachineFunction &MF, MachineBasic
   return InnermostLoop;
 }
 
+  // Second pass: handles alignment
 bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
   // Get function alignment information from MachineFunction (actual assembly-level alignment)
   const Function &F = MF.getFunction();
@@ -1399,6 +1446,49 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
   unsigned IRAlignmentValue = IRAlign ? IRAlign->value() : 1;
   AlignmentValue = std::max(AlignmentValue, IRAlignmentValue);
 
+  DBG(1, dbgs() << " Examining alignment. Function alignment: " << AlignmentValue << " bytes"
+                << ", IR alignment: " << IRAlignmentValue << "\n");
+
+  for (MachineLoop *Loop : *MLI) {
+    SmallVector<MachineLoop*, 4> InnerLoops;
+    std::function<void(MachineLoop*)> collectInnerLoops = [&](MachineLoop *L) {
+      if (L->getSubLoops().empty()) InnerLoops.push_back(L);
+      else for (MachineLoop *SubLoop : L->getSubLoops()) collectInnerLoops(SubLoop);
+    };
+    collectInnerLoops(Loop);
+
+    for (MachineLoop *InnerLoop : InnerLoops) {
+      MachineBasicBlock *Header = InnerLoop->getHeader();
+      if (!Header) continue;
+      unsigned LoopAlignment = Header->getAlignment().value();
+      const unsigned LoopInsts = countLoopInstructions(InnerLoop);
+      if (LoopAlignment == 1 && LoopUnrollASMAlignThreshold >= 0 &&
+          calculateBubbles(LoopInsts, 16) <= (unsigned)LoopUnrollASMAlignThreshold &&
+          areLoopBlocksContiguous(InnerLoop)) {
+        Header->setAlignment(Align(64));
+        LoopAlignment = 64;
+        ++NumLoopsUnrolledAndAligned;
+        DBG(4, dbgs() << "  Set 64-byte alignment for BB" << Header->getNumber()
+          << " who left " << 4*calculateBubbles(LoopInsts, 16) << " untilized bytes\n");
+      }
+
+      if (LoopAlignment == 1) continue;
+      switch (LoopAlignment) {
+        case 8: ++NumInnermostLoopsAlign8; break;
+        case 16: ++NumInnermostLoopsAlign16; break;
+        case 32: ++NumInnermostLoopsAlign32; break;
+        case 64: ++NumInnermostLoopsAlign64; break;
+        default: ++NumInnermostLoopsAlignOther; break;
+      }
+      DBG(3, dbgs() << "  Innermost loop header BB" << Header->getNumber()
+                    << " has " << LoopAlignment << "-byte alignment\n");
+    }
+  }
+
+  // Early exit if requested
+  if (!LoopUnrollASMAlignByNop)
+    return false;
+
   // Early exit if function alignment <= 4
   if (AlignmentValue <= 4)
     return false;
@@ -1408,9 +1498,6 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
          "Function alignment must be between 8 and 64 bytes (powers of 2)");
   assert(isPowerOf2_32(AlignmentValue) &&
          "Function alignment must be a power of 2");
-
-  DBG(1, dbgs() << " Examining alignment. Function alignment: " << AlignmentValue << " bytes"
-                << ", IR alignment: " << IRAlignmentValue << "\n");
 
   // Without the actual address, we can only know possible offsets from 64-byte boundary
   // For example, if function is 16-byte aligned, it could start at offsets: 0, 16, 32, 48
