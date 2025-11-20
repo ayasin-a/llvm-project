@@ -49,15 +49,15 @@ static cl::opt<bool> LoopUnrollASMAlignAll(
     cl::desc("Analyze all basic blocks for alignment issues (not just innermost loops)"),
     cl::init(true), cl::Hidden);
 
-static cl::opt<bool> LoopUnrollASMAlignByNop(
-    "loop-unroll-asm-align-by-nop",
-    cl::desc("Enable alignment via inserting NOPs"),
+static cl::opt<bool> LoopUnrollASMAlignByDirective(
+    "loop-unroll-asm-align-by-directive",
+    cl::desc("Enable alignment optimization for FCMP-FCSEL straddling"),
     cl::init(true), cl::Hidden);
 
 static cl::opt<int> LoopUnrollASMAlignThreshold(
     "loop-unroll-asm-align-threshold",
     cl::desc("Threshold for 64-byte alignment of unrolled loops (0-15: bubble threshold, -1: disable alignment)"),
-    cl::init(3), cl::Hidden,
+    cl::init(0), cl::Hidden,
     cl::callback([](const int &Val) {
       if (Val < -1 || Val > 15)report_fatal_error("loop-unroll-asm-align-threshold must be -1 or in range [0, 15]");
     }));
@@ -177,7 +177,7 @@ STATISTIC(NumInnerLoops_InvalidUncondExit, "Number of inner loops ending with we
 STATISTIC(NumInnerLoops_LastInstNotBranch, "Number of inner loops where last instruction is not a branch");
 // alignment pass
 STATISTIC(NumAlignMBBsSkippedNotInnermost, "Number of MBBs skipped (not in innermost loop)");
-STATISTIC(NumAlignNOPsInserted, "Number of NOPs inserted for FCMP+FCSEL cacheline crossings");
+STATISTIC(NumAlignmentsSetForStraddle, "Number of alignments set to prevent FCMP+FCSEL cacheline crossings");
 STATISTIC(NumInnermostLoopsAlign8, "Number of innermost loops with 8-byte alignment");
 STATISTIC(NumInnermostLoopsAlign16, "Number of innermost loops with 16-byte alignment");
 STATISTIC(NumInnermostLoopsAlign32, "Number of innermost loops with 32-byte alignment");
@@ -256,8 +256,6 @@ private:
   unsigned countLoopInstructions(const MachineLoop *Loop);
   bool areLoopBlocksContiguous(const MachineLoop *Loop);
   bool analyzeMachineInsts(MachineFunction &MF);
-  MachineLoop* insertAlignmentNOP(MachineFunction &MF, MachineBasicBlock &MBB,
-                                  MachineBasicBlock *PrevIteratedMBB);
   bool isAtomicInstruction(const MachineInstr &MI);
 };
 } // end anonymous namespace
@@ -1363,77 +1361,6 @@ bool LoopUnrollASM::areLoopBlocksContiguous(const MachineLoop *Loop) {
   return BlocksInRange == Loop->getNumBlocks();
 }
 
-/// Insert a NOP to fix FCMP+FCSEL cacheline crossing alignment issues.
-/// This function handles the complete process of determining the optimal insertion
-/// point and placing the NOP with loop-aware placement logic.
-/// Returns the innermost loop if a NOP was inserted, nullptr otherwise.
-MachineLoop* LoopUnrollASM::insertAlignmentNOP(MachineFunction &MF, MachineBasicBlock &MBB,
-                                               MachineBasicBlock *PrevIteratedMBB) {
-  // Get the innermost loop for this MBB (if any)
-  MachineLoop *CurrentLoop = MLI->getLoopFor(&MBB);
-  MachineLoop *InnermostLoop = nullptr;
-  if (CurrentLoop) {
-    InnermostLoop = CurrentLoop;
-    while (!InnermostLoop->getSubLoops().empty()) {
-      InnermostLoop = InnermostLoop->getSubLoops().front();
-    }
-  }
-  // Insert NOP immediately and adjust CurrentIndex for this FuncStartOffset
-  // insert at the end of the previous MBB in layout order, if any
-  MachineBasicBlock *TargetMBB = PrevIteratedMBB ? PrevIteratedMBB : &*MF.begin();
-
-  // If current MBB belongs to an innermost loop and PrevIteratedMBB belongs to the same loop,
-  // keep going backward until first MBB outside that loop or MF.begin()
-  if (PrevIteratedMBB) {
-    MachineLoop *CurrentLoop = MLI->getLoopFor(&MBB);
-    if (CurrentLoop && CurrentLoop->getSubLoops().empty()) { // innermost loop
-      MachineLoop *PrevLoop = MLI->getLoopFor(PrevIteratedMBB);
-      if (PrevLoop == CurrentLoop) { // same loop
-        // Go backward from PrevIteratedMBB until we find MBB outside the loop or reach beginning
-        auto I = MachineFunction::iterator(PrevIteratedMBB);
-        while (I != MF.begin()) {
-          --I;
-          MachineBasicBlock *CandidateMBB = &*I;
-          MachineLoop *CandidateLoop = MLI->getLoopFor(CandidateMBB);
-          if (CandidateLoop != CurrentLoop) {
-            TargetMBB = CandidateMBB;
-            DBG(6, dbgs() << "  Found TargetMBB outside loop: BB" << TargetMBB->getNumber() << "\n");
-            break;
-          }
-        }
-        // If we reached MF.begin(), use it regardless
-        if (I == MF.begin()) {
-          TargetMBB = &*MF.begin();
-          DBG(6, dbgs() << "  Using function start as TargetMBB: BB" << TargetMBB->getNumber() << "\n");
-        }
-      }
-    }
-  }
-  assert(TargetMBB && "TargetMBB should never be null");
-  auto InsertPos = (TargetMBB == &*MF.begin()) ? TargetMBB->begin() : TargetMBB->getFirstTerminator();
-  // Move InsertPos one instruction earlier if it points to a conditional branch and MBB has > 1 instruction
-  if (InsertPos != TargetMBB->end() && InsertPos->isConditionalBranch() && InsertPos != TargetMBB->begin()) {
-    --InsertPos;
-    DBG(6, dbgs() << "  Adjusted InsertPos: moved one instruction earlier due to conditional branch\n");
-  }
-  TII->insertNoop(*TargetMBB, InsertPos);
-  // TODO: > remove function name in debug print. Instead, if the MBB belongs to a loop, print its info invoking debugPrintLoopInfo.
-  DBG(5, {
-    std::string InsertLocation;
-    if (TargetMBB == &*MF.begin()) {
-      InsertLocation = "at start of function (beginning of first MBB)";
-    } else {
-      InsertLocation = "at end of BB" + std::to_string(TargetMBB->getNumber()) + " (before terminators)";
-    }
-    dbgs() << "  Inserting NOP in BB" << TargetMBB->getNumber() << " " << InsertLocation << "\n";
-  });
-  ++NumAlignNOPsInserted;
-  ++NumAddedInsts;
-
-  // Return the innermost loop if we inserted a NOP in a loop, nullptr otherwise
-  return InnermostLoop;
-}
-
   // Second pass: handles alignment
 bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
   // Get function alignment information from MachineFunction (actual assembly-level alignment)
@@ -1486,7 +1413,7 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
   }
 
   // Early exit if requested
-  if (!LoopUnrollASMAlignByNop)
+  if (!LoopUnrollASMAlignByDirective)
     return false;
 
   // Early exit if function alignment <= 4
@@ -1506,16 +1433,15 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
   // For analysis purposes, we'll check all possible offsets
   // But for FCMP/FCSEL analysis, what matters is relative offset within function
 
-  // Restructured: FuncStartOffset as outer loop to properly track NOPs across MBBs
-  // This ensures that NOPs inserted for one FuncStartOffset are accounted for in subsequent calculations
-  bool MadeChanges = false; // Track if any NOPs were inserted
+  // Restructured: FuncStartOffset as outer loop to properly track alignment changes across MBBs
+  // This ensures that alignment changes for one FuncStartOffset are accounted for in subsequent calculations
+  bool MadeChanges = false; // Track if any alignment changes were made
 
   for (unsigned FuncStartOffset = 0; FuncStartOffset < 64; FuncStartOffset += AlignmentValue) {
     // Reset state for each FuncStartOffset iteration
     unsigned CurrentIndex = 0;
     MachineInstr* PrevInstr = nullptr;
     MachineBasicBlock* PrevIteratedMBB = nullptr; // Track previous MBB in iteration order
-    MachineLoop* HandledLoop = nullptr; // Track which loop already had a NOP inserted
 
     for (MachineBasicBlock &MBB : MF) {
       // Skip blocks that are not in innermost loops if LoopUnrollASMAlignAll is off
@@ -1583,21 +1509,48 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
                 dbgs() << "    " << *NextI;
             });
 
-            // Check if current MBB belongs to already handled loop
-            MachineLoop *CurrentLoop = MLI->getLoopFor(&MBB);
-            if (!HandledLoop || !CurrentLoop || !CurrentLoop->contains(HandledLoop->getHeader())) {
-              // Either no loop handled yet, or current MBB is in a different loop
-              MachineLoop *NewHandledLoop = insertAlignmentNOP(MF, MBB, PrevIteratedMBB);
-              if (NewHandledLoop) {
-                HandledLoop = NewHandledLoop;
-                DBG(6, dbgs() << "  Handled loop for BB" << MBB.getNumber() << " - will skip future BBs in this loop\n");
-              }
-              MadeChanges = true;
+            // Find target for alignment: innermost loop header or MBB itself
+            MachineBasicBlock *AlignTarget = &MBB;
 
-              // Adjust CurrentIndex since NOP affects subsequent calculations in this FuncStartOffset iteration
-              CurrentIndex += 1; // Account for the inserted NOP
+            MachineLoop *CurrentLoop = MLI->getLoopFor(&MBB);
+            if (CurrentLoop && CurrentLoop->getSubLoops().empty()) {
+              // MBB is in an innermost loop - align first BB in layout order for better I-cache alignment
+
+              MachineBasicBlock *LoopHeader = CurrentLoop->getHeader();
+              MachineBasicBlock *FirstBBInLayout = nullptr;
+
+              // Find first loop block in layout order
+              for (MachineBasicBlock &LayoutMBB : MF) {
+                if (CurrentLoop->contains(&LayoutMBB)) {
+                  FirstBBInLayout = &LayoutMBB;
+                  break;
+                }
+              }
+
+              // FirstBBInLayout must always be found since CurrentLoop is non-empty
+              assert(FirstBBInLayout && "FirstBBInLayout must be found for non-empty loop");
+              AlignTarget = FirstBBInLayout;
+              DBG(6, dbgs() << "  Setting alignment on first loop BB in layout order BB"
+                            << AlignTarget->getNumber() << " (header: BB" << LoopHeader->getNumber() << ")\n");
             } else {
-              DBG(6, dbgs() << "  Skipping NOP insertion - BB" << MBB.getNumber() << " belongs to already handled loop\n");
+              DBG(6, dbgs() << "  Setting alignment on MBB " << AlignTarget->getNumber() << "\n");
+            }
+
+            // Calculate minimum alignment to prevent FCMP-FCSEL straddling
+            // FCMP+FCSEL need 8 bytes total, cacheline is 16 bytes
+            // Use 16-byte alignment to ensure proper placement
+            unsigned RequiredAlign = 16;
+            unsigned CurrentAlign = AlignTarget->getAlignment().value();
+
+            if (CurrentAlign < RequiredAlign) {
+              AlignTarget->setAlignment(Align(RequiredAlign));
+              DBG(6, dbgs() << "  Set " << RequiredAlign << "-byte alignment on BB"
+                            << AlignTarget->getNumber() << " to prevent FCMP-FCSEL straddling\n");
+              ++NumAlignmentsSetForStraddle;
+              MadeChanges = true;
+            } else {
+              DBG(6, dbgs() << "  BB" << AlignTarget->getNumber() << " already has sufficient alignment ("
+                            << CurrentAlign << " >= " << RequiredAlign << ")\n");
             }
 
             // Continue to check for more crossings in this function
