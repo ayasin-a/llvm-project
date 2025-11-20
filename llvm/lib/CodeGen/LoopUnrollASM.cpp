@@ -149,7 +149,7 @@ STATISTIC(NumLoopsDetected, "Number of tight loops detected by LoopUnrollASM");
 STATISTIC(NumLoopsUnrolled, "Number of tight loops unrolled by LoopUnrollASM");
 STATISTIC(NumLoopsUnrolledCondUncond, "Number of tight loops unrolled with cond+uncond terminators");
 STATISTIC(NumLoopsUnrolledMultiCondExit, "Number of tight loops unrolled with multi-cond-exit+backedge pattern");
-STATISTIC(NumLoopsUnrolledAndAligned, "Number of loops unrolled and aligned to 64 bytes");
+STATISTIC(NumInnermostLoopsAligned, "Number of innermost loops aligned to 64 bytes");
 STATISTIC(NumLoopsNotEnoughBubbles, "Number of tight loops skipped (not enough bubbles)");
 STATISTIC(NumAddedInsts, "Number of added instruction by loop-unroll-asm pass");
 STATISTIC(NumInnermostLoops, "Number of inner-most loops");
@@ -1378,7 +1378,7 @@ MachineLoop* LoopUnrollASM::insertAlignmentNOP(MachineFunction &MF, MachineBasic
       InnermostLoop = InnermostLoop->getSubLoops().front();
     }
   }
-  // Insert NOP immediately and adjust CurrentOffset for this FuncStartOffset
+  // Insert NOP immediately and adjust CurrentIndex for this FuncStartOffset
   // insert at the end of the previous MBB in layout order, if any
   MachineBasicBlock *TargetMBB = PrevIteratedMBB ? PrevIteratedMBB : &*MF.begin();
 
@@ -1467,7 +1467,7 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
           areLoopBlocksContiguous(InnerLoop)) {
         Header->setAlignment(Align(64));
         LoopAlignment = 64;
-        ++NumLoopsUnrolledAndAligned;
+        ++NumInnermostLoopsAligned;
         DBG(4, dbgs() << "  Set 64-byte alignment for BB" << Header->getNumber()
           << " who left " << 4*calculateBubbles(LoopInsts, 16) << " untilized bytes\n");
       }
@@ -1512,7 +1512,7 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
 
   for (unsigned FuncStartOffset = 0; FuncStartOffset < 64; FuncStartOffset += AlignmentValue) {
     // Reset state for each FuncStartOffset iteration
-    unsigned CurrentOffset = 0;
+    unsigned CurrentIndex = 0;
     MachineInstr* PrevInstr = nullptr;
     MachineBasicBlock* PrevIteratedMBB = nullptr; // Track previous MBB in iteration order
     MachineLoop* HandledLoop = nullptr; // Track which loop already had a NOP inserted
@@ -1535,6 +1535,20 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
       // Reset previous instruction state at start of each MBB to prevent cross-MBB detection
       PrevInstr = nullptr;
 
+      // Handle MBB alignment by adjusting CurrentIndex for alignment padding
+      if (unsigned MBBAlign = MBB.getAlignment().value(); MBBAlign > 4) {
+        // Calculate potential padding due to MBB alignment
+        // CurrentIndex is in 4-byte instruction units, convert to bytes for alignment calc
+        unsigned CurrentByteOffset = CurrentIndex * 4 + FuncStartOffset;
+        unsigned AlignedOffset = alignTo(CurrentByteOffset, MBBAlign);
+        unsigned PaddingBytes = AlignedOffset - CurrentByteOffset;
+        // Convert padding back to instruction units (divide by 4)
+        CurrentIndex += (PaddingBytes / 4);
+        DBG(6, dbgs() << "  MBB " << MBB.getNumber() << " has " << MBBAlign
+                      << "-byte alignment, added " << (PaddingBytes / 4)
+                      << " instruction slots for padding\n");
+      }
+
       for (auto I = MBB.begin(), E = MBB.end(); I != E; ++I) {
         MachineInstr &MI = *I;
 
@@ -1542,7 +1556,7 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
         if (MI.isDebugInstr() || MI.isPseudo())
           continue;
 
-        DBG(8, dbgs() << "     InstOffset=" << (CurrentOffset + FuncStartOffset / 4)
+        DBG(8, dbgs() << "     InstOffset=" << (CurrentIndex + FuncStartOffset / 4)
                       << " BB=" << MBB.getNumber()
                       << " FuncOffset=" << FuncStartOffset
                       << " " << MI);
@@ -1550,17 +1564,16 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
         StringRef OpcodeName = TII->getName(MI.getOpcode());
 
         // Check if previous instruction was FCMP and current is FCSEL
-        if (PrevInstr && (CurrentOffset % 2) == 0 && OpcodeName.starts_with("FCSEL")
+        if (PrevInstr && (CurrentIndex % 2) == 0 && OpcodeName.starts_with("FCSEL")
             && TII->getName(PrevInstr->getOpcode()).starts_with("FCMP")) {
-          DBG(8, dbgs() << "    FCMP at odd offset: PrevOffset=" << (CurrentOffset - 1) << " CurrentOffset=" << CurrentOffset << "\n");
           // Calculate actual offsets including function start offset
-          unsigned FCMPActualOffset = (CurrentOffset - 1) * 4 + FuncStartOffset;
-          unsigned FCSELActualOffset = CurrentOffset * 4 + FuncStartOffset;
+          unsigned FCMPActualOffset = (CurrentIndex - 1) * 4 + FuncStartOffset;
+          unsigned FCSELActualOffset = CurrentIndex * 4 + FuncStartOffset;
 
           // Check if FCMP and FCSEL cross cacheline boundaries (cacheline is offset / 16)
           if ((FCMPActualOffset / 16) != (FCSELActualOffset / 16)) {
             DBG(6, {
-              dbgs() << "    FuncStartOffset=" << FuncStartOffset << " CurrentOffset=" << CurrentOffset << " FoundCrossing=1 BB=" << MBB.getNumber() << "\n";
+              dbgs() << "    FuncStartOffset=" << FuncStartOffset << " CurrentIndex=" << CurrentIndex << " FoundCrossing=1 BB=" << MBB.getNumber() << "\n";
               dbgs() << "    " << MI;
               // Find the next real (non-debug, non-pseudo) instruction
               auto NextI = std::next(I);
@@ -1581,8 +1594,8 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
               }
               MadeChanges = true;
 
-              // Adjust CurrentOffset since NOP affects subsequent calculations in this FuncStartOffset iteration
-              CurrentOffset += 1; // Account for the inserted NOP
+              // Adjust CurrentIndex since NOP affects subsequent calculations in this FuncStartOffset iteration
+              CurrentIndex += 1; // Account for the inserted NOP
             } else {
               DBG(6, dbgs() << "  Skipping NOP insertion - BB" << MBB.getNumber() << " belongs to already handled loop\n");
             }
@@ -1594,7 +1607,7 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
         // Update previous instruction info for next iteration
         PrevInstr = &MI;
 
-        CurrentOffset += 1; // Increment by 1 instruction (multiply by 4 for byte offset when needed)
+        CurrentIndex += 1; // Increment by 1 instruction (multiply by 4 for byte offset when needed)
       } // for MachineInstr
 
       // Update previous MBB for next iteration
