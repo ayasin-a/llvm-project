@@ -114,8 +114,8 @@ static cl::opt<unsigned> LoopUnrollASMMinBubbles(
 static cl::opt<unsigned> LoopUnrollASMSkip(
     "loop-unroll-asm-skip",
     cl::desc("Bitmask to control DO_SKIP heuristics "
-             "(bit 0: HasMadd, bit 1: HasVectorByElement, bit 2: HasRsqrt)"),
-    cl::init(0x1), cl::Hidden);
+             "(bit 0: HasMadd, bit 1: HasVectorByElement, bit 2: HasRsqrt, bit 3: HasCall)"),
+    cl::init(0x9), cl::Hidden);
 
 #define DBG(level, ...) do { \
   if (level <= LoopUnrollASMDebug) { \
@@ -180,6 +180,7 @@ STATISTIC(NumInnerLoopsBranchIndirect, "Number of inner loops skipped (indirect 
 STATISTIC(NumInnerLoopsBranchConditionalNoBackedge, "Number of inner loops skipped (conditional branch without backedge)");
 STATISTIC(NumInnerLoopsHasAtomicOps, "Number of inner loops skipped (has atomic ops)");
 STATISTIC(NumInnerLoopsHasInternalBranch, "Number of inner loops skipped (has internal branch)");
+STATISTIC(NumInnerLoopsHasCall, "Number of inner loops skipped (has CALL omst)");
 STATISTIC(NumInnerLoopsHasMadd, "Number of inner loops skipped (has MADD inst)");
 STATISTIC(NumInnerLoopsHasVectorByElement, "Number of inner loops skipped (has vector load/store by-element)");
 STATISTIC(NumInnerLoopsHasRsqrt, "Number of inner loops skipped (has RQSRT inst)");
@@ -696,10 +697,15 @@ std::optional<unsigned> LoopUnrollASM::calculateLoopCount(const iterator_range<M
 
       // We want to exclude loops with any control flow changing instructions
       // (branches, calls, returns) except for the terminator
-      if ((MI.isBranch() || MI.isCall() || MI.isReturn()) &&
-          !MI.isTerminator()) {
+      if (MI.isBranch() && !MI.isTerminator())
         InternalBranches.push_back(&MI);
-      }
+
+      // Check for call instructions
+      if (MI.isCall() && (LoopUnrollASMSkip & 0x8))
+        DO_SKIP_HELPER(HasCall);
+
+      // Assert that there are no return instructions (except terminators)
+      assert(!MI.isReturn() && "Loop contains internal return instruction");
 
       // Check for atomic operations
       if (isAtomicInstruction(MI))
@@ -746,18 +752,15 @@ std::optional<TerminatorPattern> LoopUnrollASM::checkForSimpleSubLoopPattern(Mac
   // Traverse blocks in layout order to find backward conditional branch
   for (MachineBasicBlock *MBB : LoopBlocksInOrder) {
     TraversedBlocks.push_back(MBB);
+    MachineInstr *LastBranch = nullptr;
+    for (MachineInstr &MI : *MBB)
+      if (MI.isBranch())
+        LastBranch = &MI;
 
-    // Find the last branch/call in this block
-    MachineInstr *LastBranchOrCall = nullptr;
-    for (MachineInstr &MI : *MBB) {
-      if (MI.isBranch() || MI.isCall())
-        LastBranchOrCall = &MI;
-    }
-
-    // Check if the last branch/call is a backward conditional branch
-    if (LastBranchOrCall && LastBranchOrCall->isConditionalBranch()) {
+    // Check if the last branch is a backward conditional branch
+    if (LastBranch && LastBranch->isConditionalBranch()) {
       // Check if it branches to a previously traversed block
-      for (const MachineOperand &MO : LastBranchOrCall->operands()) {
+      for (const MachineOperand &MO : LastBranch->operands()) {
         if (MO.isMBB()) {
           MachineBasicBlock *Target = MO.getMBB();
           if (llvm::find(TraversedBlocks, Target) != TraversedBlocks.end()) {
