@@ -12,6 +12,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
@@ -34,6 +35,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include <cassert>
+#include <optional>
 
 using namespace llvm;
 
@@ -57,7 +59,7 @@ static cl::opt<bool> LoopUnrollASMAlignByDirective(
 static cl::opt<int> LoopUnrollASMAlignThreshold(
     "loop-unroll-asm-align-threshold",
     cl::desc("Threshold for 64-byte alignment of unrolled loops (0-15: bubble threshold, -1: disable alignment)"),
-    cl::init(0), cl::Hidden,
+    cl::init(-1), cl::Hidden,
     cl::callback([](const int &Val) {
       if (Val < -1 || Val > 15)report_fatal_error("loop-unroll-asm-align-threshold must be -1 or in range [0, 15]");
     }));
@@ -144,6 +146,20 @@ static cl::opt<unsigned> LoopUnrollASMSkip(
 // Optional second parameter for additional details concatenated to the skip message
 #define DO_SKIP(...) GET_MACRO(__VA_ARGS__, DO_SKIP_2, DO_SKIP_1, )(__VA_ARGS__)
 
+#define DO_SKIP_HELPER_1(suffix) { \
+  ++NumInnerLoops##suffix; \
+  DBG_SKIP(#suffix); \
+  return std::nullopt; \
+}
+#define DO_SKIP_HELPER_2(suffix, msg) { \
+  ++NumInnerLoops##suffix; \
+  DBG(3, dbgs() << "  skipping: " << #suffix << " " << msg << "\n"); \
+  return std::nullopt; \
+}
+
+// DO_SKIP_HELPER variant that returns std::nullopt for use in helper functions
+#define DO_SKIP_HELPER(...) GET_MACRO(__VA_ARGS__, DO_SKIP_HELPER_2, DO_SKIP_HELPER_1, )(__VA_ARGS__)
+
 // totals
 STATISTIC(NumLoopsDetected, "Number of tight loops detected by LoopUnrollASM");
 STATISTIC(NumLoopsUnrolled, "Number of tight loops unrolled by LoopUnrollASM");
@@ -170,6 +186,7 @@ STATISTIC(NumInnerLoopsHasRsqrt, "Number of inner loops skipped (has RQSRT inst)
 STATISTIC(NumInnerLoopsTooManyBlocks, "Number of inner loops skipped (too many blocks)");
 STATISTIC(NumInnerLoopsTooManyInsts, "Number of inner loops skipped (too many instructions)");
 STATISTIC(NumInnerLoopsBranchPrepFailure, "Number of loops skipped (branch analysis or condition inversion failed)");
+STATISTIC(NumInnerLoopsHasGoodSubLoop, "Number of inner loops skipped (has good sub-loop pattern)");
 // dev stats
 STATISTIC(NumInnerLoops_BackedgeFallthruHeader, "Number of inner loops where Backedge branch fallsthrough into Loop Header");
 STATISTIC(NumInnerLoops_HasFcmpFcsel, "Number of inner loops with FCMP-FCSEL pair");
@@ -189,7 +206,8 @@ enum TerminatorPattern {
   Nonsupported = 0,
   One_Backedge,
   Two_Backedge_Uncond,
-  Multi_CondExit_Backedge
+  Multi_CondExit_Backedge,
+  Simple_SubLoop,
 };
 
 struct BackedgeInfo {
@@ -249,12 +267,16 @@ private:
   bool processLoop(MachineLoop *Loop, MachineFunction &MF);
   bool processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                         MachineBasicBlock *Header, unsigned LoopCount,
-                        BackedgeInfo &Backedge);
+                        BackedgeInfo &Backedge, unsigned LoopInsts);
   unsigned findBestUnrollCount(unsigned LoopCount, unsigned Bubbles);
   void duplicateLoopBody(MachineLoop *Loop, unsigned UnrollFactor,
-                         const BackedgeInfo &Backedge);
+                         const BackedgeInfo &Backedge, unsigned NumInsts,
+                         const SmallVectorImpl<MachineBasicBlock *> &LoopBlocksInOrder);
+  std::optional<unsigned> calculateLoopCount(const iterator_range<MachineLoop::block_iterator> Blocks,
+                                           SmallVectorImpl<MachineInstr *> &InternalBranches);
   unsigned countLoopInstructions(const MachineLoop *Loop);
   bool areLoopBlocksContiguous(const MachineLoop *Loop);
+  std::optional<TerminatorPattern> checkForSimpleSubLoopPattern(MachineLoop *Loop, MachineFunction &MF, TerminatorPattern &Pattern);
   bool analyzeMachineInsts(MachineFunction &MF);
   bool isAtomicInstruction(const MachineInstr &MI);
 };
@@ -606,39 +628,14 @@ bool LoopUnrollASM::isLoopSimplifyForm(const MachineLoop *Loop) {
   return true;
 }
 
-  // First pass: handles loop-unrolling
-bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
-  // Process inner loops first (depth-first)
-  bool Changed = false;
-  for (MachineLoop *SubLoop : *Loop) {
-    Changed |= processLoop(SubLoop, MF);
-  }
-
-  MachineBasicBlock *Header = Loop->getHeader();
-  DBG(3, debugPrintLoopInfo(MF, Loop, " Examining"));
-  // Only process innermost loops
-  if (!Loop->getSubLoops().empty()) {
-    DBG_SKIP("non-innermost");
-    return Changed;
-  }
-  ++NumInnermostLoops;
-
-  // Skip loops with too many basic blocks
-  // TODO: count loop with internal branches that create short paths
-  if (Loop->getNumBlocks() > LoopUnrollASMMaxBlocks)
-    DO_SKIP(TooManyBlocks, "(" << Loop->getNumBlocks() << " > " << LoopUnrollASMMaxBlocks << ")");
-
-  // Count instructions in the loop and check for internal branches
-  // We want to skip loops that have branches within the loop body
-  // (excluding the terminator back-edge branch)
-  MachineInstr *BackedgeBranch = findLoopBackedgeBranch(Loop);
+std::optional<unsigned> LoopUnrollASM::calculateLoopCount(const iterator_range<MachineLoop::block_iterator> Blocks,
+                                                        SmallVectorImpl<MachineInstr *> &InternalBranches) {
   unsigned LoopCount = 0;
-  SmallVector<MachineInstr *, 4> InternalBranches;
 
   // Calculate a precise LoopCount based on the loop size (in # fetch slots)
   // TODO: this should eventually interface with TTI
   MachineInstr *PrevInst = nullptr;
-  for (MachineBasicBlock *MBB : Loop->blocks()) {
+  for (MachineBasicBlock *MBB : Blocks) {
     for (MachineInstr &MI : *MBB) {
       // Skip debug instructions and pseudo instructions
       if (MI.isDebugInstr() || MI.isPseudo())
@@ -687,7 +684,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         // Integer multiply-add has additional overhead
         ++LoopCount;
         if (OpcodeName.starts_with("MADD") && (LoopUnrollASMSkip & 0x1))
-          DO_SKIP(HasMadd);
+          DO_SKIP_HELPER(HasMadd);
       }
       // Check for Synchronization Barrier instructions
       // DMB (Data Memory Barrier), DSB (Data Synchronization Barrier), ISB (Instruction Synchronization Barrier)
@@ -706,20 +703,129 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
 
       // Check for atomic operations
       if (isAtomicInstruction(MI))
-        DO_SKIP(HasAtomicOps);
+        DO_SKIP_HELPER(HasAtomicOps);
 
       // Check for vector load/store by-element instructions (LD1, LD2, LD3, LD4, ST1, ST2, ST3, ST4)
       if (startsWithAny({"LD1", "LD2", "LD3", "LD4", "ST1", "ST2", "ST3", "ST4"}) && (LoopUnrollASMSkip & 0x2))
-        DO_SKIP(HasVectorByElement);
+        DO_SKIP_HELPER(HasVectorByElement);
 
       // Check for RQSRT (Reciprocal Square Root) instructions
       if (OpcodeName.contains_insensitive("rsqrt") && (LoopUnrollASMSkip & 0x4))
-        DO_SKIP(HasRsqrt);
+        DO_SKIP_HELPER(HasRsqrt);
 
       // Track previous instruction for fusion detection
       PrevInst = &MI;
     }
   }
+
+  return LoopCount;
+}
+
+/// Check for Simple_SubLoop pattern: first branch is backward conditional to first loop block
+std::optional<TerminatorPattern> LoopUnrollASM::checkForSimpleSubLoopPattern(MachineLoop *Loop, MachineFunction &MF, TerminatorPattern &Pattern) {
+  // Check for Simple_SubLoop pattern: first branch is backward conditional to first loop block
+  bool FoundSubLoop = false;
+
+  // Get loop blocks in layout order
+  SmallVector<MachineBasicBlock *, 4> LoopBlocksInOrder;
+  for (MachineBasicBlock &MBB : MF) {
+    if (Loop->contains(&MBB)) {
+      LoopBlocksInOrder.push_back(&MBB);
+    }
+  }
+
+  SmallVector<MachineBasicBlock *, 4> SubLoopBlocksInOrder;
+
+  assert(!LoopBlocksInOrder.empty() && "LoopBlocksInOrder should not be empty");
+
+  // Find valid sub-loop pattern: sequence ending with backward conditional branch
+  MachineBasicBlock *BackwardBranchBlock = nullptr;
+  MachineBasicBlock *BackwardBranchTarget = nullptr;
+  SmallVector<MachineBasicBlock *, 4> TraversedBlocks;
+
+  // Traverse blocks in layout order to find backward conditional branch
+  for (MachineBasicBlock *MBB : LoopBlocksInOrder) {
+    TraversedBlocks.push_back(MBB);
+
+    // Find the last branch/call in this block
+    MachineInstr *LastBranchOrCall = nullptr;
+    for (MachineInstr &MI : *MBB) {
+      if (MI.isBranch() || MI.isCall())
+        LastBranchOrCall = &MI;
+    }
+
+    // Check if the last branch/call is a backward conditional branch
+    if (LastBranchOrCall && LastBranchOrCall->isConditionalBranch()) {
+      // Check if it branches to a previously traversed block
+      for (const MachineOperand &MO : LastBranchOrCall->operands()) {
+        if (MO.isMBB()) {
+          MachineBasicBlock *Target = MO.getMBB();
+          if (llvm::find(TraversedBlocks, Target) != TraversedBlocks.end()) {
+            // Found valid backward conditional branch
+            FoundSubLoop = true;
+            BackwardBranchBlock = MBB;
+            BackwardBranchTarget = Target;
+            break;
+          }
+        }
+      }
+    }
+
+    if (FoundSubLoop) break;
+  }
+
+  // Collect sub-loop blocks from target to branch block (inclusive)
+  if (FoundSubLoop && BackwardBranchBlock && BackwardBranchTarget) {
+    bool InRange = false;
+    for (MachineBasicBlock *MBB : LoopBlocksInOrder) {
+      if (MBB == BackwardBranchTarget)
+        InRange = true;
+      if (InRange)
+        SubLoopBlocksInOrder.push_back(MBB);
+      if (MBB == BackwardBranchBlock)
+        break;
+    }
+  }
+
+  if (FoundSubLoop) {
+    std::string BlockList;
+    for (auto *MBB : SubLoopBlocksInOrder) {
+      if (!BlockList.empty()) BlockList += ",";
+      BlockList += std::to_string(MBB->getNumber());
+    }
+    DO_SKIP_HELPER(HasGoodSubLoop, "blocks: " << BlockList);
+  }
+
+  return Pattern;
+}
+
+  // First pass: handles loop-unrolling
+bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
+  // Process inner loops first (depth-first)
+  bool Changed = false;
+  for (MachineLoop *SubLoop : *Loop) {
+    Changed |= processLoop(SubLoop, MF);
+  }
+
+  MachineBasicBlock *Header = Loop->getHeader();
+  DBG(3, debugPrintLoopInfo(MF, Loop, " Examining"));
+  // Only process innermost loops
+  if (!Loop->getSubLoops().empty())
+    DBG_SKIP("non-innermost");
+  ++NumInnermostLoops;
+
+  // Count instructions in the loop and check for internal branches
+  // We want to skip loops that have branches within the loop body
+  // (excluding the terminator back-edge branch)
+  MachineInstr *BackedgeBranch = findLoopBackedgeBranch(Loop);
+  unsigned LoopCount = 0;
+  SmallVector<MachineInstr *, 4> InternalBranches;
+
+  // Calculate LoopCount using helper function
+  if (auto OptionalCount = calculateLoopCount(Loop->blocks(), InternalBranches))
+    LoopCount = *OptionalCount;
+  else
+    return Changed; // Helper function indicated we should skip this loop
 
   // Lambda to check if a branch instruction targets any block outside the loop
   auto branchTargetsExit = [&](const MachineInstr *MI) -> bool {
@@ -811,6 +917,15 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       //return Changed;
     }
   }
+
+  // Check for Simple_SubLoop pattern for all cases
+  if (Pattern == Nonsupported) {
+    if (auto OptionalPattern = checkForSimpleSubLoopPattern(Loop, MF, Pattern))
+      Pattern = *OptionalPattern;
+    else
+      return Changed; // Helper function indicated we should skip this loop
+  }
+
   if (NumTerminators > 1 && Pattern == Nonsupported) {
     // TODO: this may replace the more complex Latch based logic above
     if (Pattern == Nonsupported && lastUnconditionalExitBranch && NumTerminators == 2 && BackedgeBranch) {
@@ -848,6 +963,11 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       return Changed;
     }
   } // NumTerminators > 1
+
+  // Skip loops with too many basic blocks
+  // TODO: count loop with internal branches that create short paths
+  if (Loop->getNumBlocks() > LoopUnrollASMMaxBlocks)
+    DO_SKIP(TooManyBlocks, "(" << Loop->getNumBlocks() << " > " << LoopUnrollASMMaxBlocks << ")");
 
   if (!BackedgeBranch)
     DO_SKIP(BranchConditionalNoBackedge);
@@ -900,10 +1020,11 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   // an unconditional exit branch that ends a loop won't be unrolled
   unsigned AdjustedLoopCount = lastUnconditionalExitBranch ? LoopCount - 1 : LoopCount;
 
+  unsigned NumInsts = countLoopInstructions(Loop);
   SmallVector<MachineOperand, 4> EmptyCond;
   BackedgeInfo BackedgeInfoObj(BackedgeBranch, Pattern, ExitBlock, EmptyCond, EmptyCond,
                                 lastUnconditionalExitBranch != nullptr);
-  return processTightLoop(Loop, MF, Header, AdjustedLoopCount, BackedgeInfoObj);
+  return processTightLoop(Loop, MF, Header, AdjustedLoopCount, BackedgeInfoObj, NumInsts);
 }
 
 void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
@@ -974,7 +1095,8 @@ void LoopUnrollASM::debugPrintLoopInfo(MachineFunction &MF,
 bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
                                      MachineBasicBlock *Header,
                                      unsigned LoopCount,
-                                     BackedgeInfo &Backedge) {
+                                     BackedgeInfo &Backedge,
+                                     unsigned LoopInsts) {
   ++NumLoopsDetected;
 
   const unsigned LoopCycles =
@@ -1009,13 +1131,21 @@ bool LoopUnrollASM::processTightLoop(MachineLoop *Loop, MachineFunction &MF,
       return false;
     }
 
-    unsigned LoopInsts = countLoopInstructions(Loop);
     DBG(3, {debugPrintLoopInfo(MF, Loop, " Found qualifying", Backedge.ExitBlock);
       dbgs() << "  with Loop count: " << LoopCount << " for " << LoopInsts << " instructions\n";});
     unsigned UC = findBestUnrollCount(LoopCount, Bubbles);
-    duplicateLoopBody(Loop, UC, Backedge);
+
+    // Collect loop blocks in their layout order (not Loop->blocks() order)
+    SmallVector<MachineBasicBlock *, 4> LoopBlocksInOrder;
+    for (MachineBasicBlock &MBB : MF) {
+      if (Loop->contains(&MBB)) {
+        LoopBlocksInOrder.push_back(&MBB);
+      }
+    }
 
     LoopInsts = Backedge.Pattern == Two_Backedge_Uncond ? LoopInsts - 1 : LoopInsts;
+    duplicateLoopBody(Loop, UC, Backedge, LoopInsts, LoopBlocksInOrder);
+
     NumAddedInsts += (UC - 1) * LoopInsts;
     ++NumLoopsUnrolled;
     if (Backedge.Pattern == Two_Backedge_Uncond) {
@@ -1065,7 +1195,9 @@ unsigned LoopUnrollASM::findBestUnrollCount(unsigned LoopCount,
 
 void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
                                       unsigned UnrollFactor,
-                                      const BackedgeInfo &Backedge) {
+                                      const BackedgeInfo &Backedge,
+                                      unsigned NumInsts,
+                                      const SmallVectorImpl<MachineBasicBlock *> &LoopBlocksInOrder) {
   assert (UnrollFactor > 1);
 
   MachineLoopInfo &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
@@ -1077,14 +1209,6 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
   // Use a map to maintain per-block instruction lists for multi-block loops
   DenseMap<MachineBasicBlock *, SmallVector<MachineInstr *, 16>> InstsToClone;
 
-  // Collect loop blocks in their layout order (not Loop->blocks() order)
-  SmallVector<MachineBasicBlock *, 4> LoopBlocksInOrder;
-  for (MachineBasicBlock &MBB : *MF) {
-    if (Loop->contains(&MBB)) {
-      LoopBlocksInOrder.push_back(&MBB);
-    }
-  }
-
   for (MachineBasicBlock *MBB : LoopBlocksInOrder) {
     SmallVector<MachineInstr *, 16> &BlockInsts = InstsToClone[MBB];
     for (MachineInstr &MI : *MBB) {
@@ -1094,20 +1218,16 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
 
       // For the backedge block, skip terminators (we'll insert new ones)
       // For other blocks, include terminators (they need to be cloned)
-      if (MI.isTerminator() && MBB == BackedgeBlock)
+      // For Simple_SubLoop pattern, check conditional branch instead of terminator
+      if (MBB == BackedgeBlock &&
+          (Backedge.Pattern == Simple_SubLoop ? MI.isConditionalBranch() : MI.isTerminator()))
         continue;
 
       BlockInsts.push_back(&MI);
     }
   }
 
-  // Use the branch analysis results passed in from the parent function
-
-  unsigned TotalInsts = 0;
-  for (const auto &Entry : InstsToClone)
-    TotalInsts += Entry.second.size();
-  TotalInsts += 1; // for Backedge terminator
-  DBG(4, dbgs() << "  Original loop has " << TotalInsts << " instructions spanning " << Loop->getNumBlocks() << " blocks.\n");
+  DBG(4, dbgs() << "  Original loop has " << NumInsts << " instructions spanning " << Loop->getNumBlocks() << " blocks.\n");
 
   // We need to create new basic blocks for proper control flow
   // The structure will be:
@@ -1185,9 +1305,8 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
     BackedgeBlock->addSuccessor(NewBlocks[0][0]);
   // ExitBlock successor should already be there
 
-  // For Multi_CondExit_Backedge pattern, update successors for original non-backedge blocks
-  // These blocks keep their terminators but need CFG successors updated to point to
-  // duplicated blocks in the first unrolled iteration
+  // Update successors for original non-backedge blocks who keep their terminators 
+  // but need CFG successors updated to point to duplicated blocks in the first unrolled iteration
   if (Backedge.Pattern == Multi_CondExit_Backedge) {
     for (unsigned j = 0; j < LoopBlocksInOrder.size(); ++j) {
       MachineBasicBlock *OrigMBB = LoopBlocksInOrder[j];
@@ -1273,22 +1392,15 @@ void LoopUnrollASM::duplicateLoopBody(MachineLoop *Loop,
 
   DBG(4, dbgs() << "  Duplicated loop body with unroll factor " << UnrollFactor << "\n");
 
-  // Verify instruction count matches expectations
-  unsigned NewLoopInstCount = 0;
-  for (MachineBasicBlock *MBB : Loop->blocks()) {
-    for (MachineInstr &MI : *MBB) {
-      if (MI.isPHI() || MI.isDebugInstr())
-        continue;
-      ++NewLoopInstCount;
-    }
-  }
+  // Verify instruction count matches expectations using helper function
+  unsigned NewLoopInstCount = countLoopInstructions(Loop);
 
-  unsigned ExpectedInstCount = UnrollFactor * TotalInsts;
+  unsigned ExpectedInstCount = UnrollFactor * NumInsts;
   if (NewLoopInstCount != ExpectedInstCount && NewLoopInstCount != (ExpectedInstCount+1)) {
     dbgs() << "ERROR: Instruction count mismatch after loop unrolling!\n";
     dbgs() << "  Pattern: " << Backedge.Pattern << " EndsWithUncondExit=" << Backedge.EndsWithUncondExit << "\n";
     dbgs() << "  Expected: " << ExpectedInstCount
-           << " (UnrollFactor=" << UnrollFactor << " * TotalInsts=" << TotalInsts << ")\n";
+           << " (UnrollFactor=" << UnrollFactor << " * NumInsts=" << NumInsts << ")\n";
     dbgs() << "  Actual: " << NewLoopInstCount << "\n";
 
     debugPrintLoopInfo(*MF, Loop, " ", Backedge.ExitBlock);
@@ -1441,7 +1553,6 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
     // Reset state for each FuncStartOffset iteration
     unsigned CurrentIndex = 0;
     MachineInstr* PrevInstr = nullptr;
-    MachineBasicBlock* PrevIteratedMBB = nullptr; // Track previous MBB in iteration order
 
     for (MachineBasicBlock &MBB : MF) {
       // Skip blocks that are not in innermost loops if LoopUnrollASMAlignAll is off
@@ -1453,7 +1564,6 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
           DBG(5, dbgs() << "Skipping MBB " << MBB.getName()
                            << " - not in innermost loop\n");
           ++NumAlignMBBsSkippedNotInnermost;
-          PrevIteratedMBB = &MBB; // Update previous MBB even when skipping
           continue;
         }
       }
@@ -1562,9 +1672,6 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
 
         CurrentIndex += 1; // Increment by 1 instruction (multiply by 4 for byte offset when needed)
       } // for MachineInstr
-
-      // Update previous MBB for next iteration
-      PrevIteratedMBB = &MBB;
     } // for MachineBasicBlock
 
     // If we found any crossing for this FuncStartOffset, we're done
