@@ -170,11 +170,11 @@ STATISTIC(NumInnerLoopsMultipleTerminators3, "Number of inner loops skipped (3 t
 STATISTIC(NumInnerLoopsMultipleTerminators4Plus, "Number of inner loops skipped (4+ terminators)");
 STATISTIC(NumInnerLoopsInvalid, "Number of inner loops skipped (invalid)");
 STATISTIC(NumInnerLoopsBranchUnconditional, "Number of inner loops skipped (unconditional branch)");
-STATISTIC(NumInnerLoopsBranchIndirect, "Number of inner loops skipped (indirect branch)");
+STATISTIC(NumInnerLoopsHasIndirect, "Number of inner loops skipped (indirect branch/call)");
 STATISTIC(NumInnerLoopsBranchConditionalNoBackedge, "Number of inner loops skipped (conditional branch without backedge)");
 STATISTIC(NumInnerLoopsHasAtomicOps, "Number of inner loops skipped (has atomic ops)");
 STATISTIC(NumInnerLoopsHasInternalBranch, "Number of inner loops skipped (has internal branch)");
-STATISTIC(NumInnerLoopsHasCall, "Number of inner loops skipped (has CALL omst)");
+STATISTIC(NumInnerLoopsHasCall, "Number of inner loops skipped (has direct CALL omst)");
 STATISTIC(NumInnerLoopsHasMadd, "Number of inner loops skipped (has MADD inst)");
 STATISTIC(NumInnerLoopsHasVectorByElement, "Number of inner loops skipped (has vector load/store by-element)");
 STATISTIC(NumInnerLoopsHasRsqrt, "Number of inner loops skipped (has RQSRT inst)");
@@ -695,6 +695,9 @@ std::optional<unsigned> LoopUnrollASM::calculateLoopCount(const iterator_range<M
         DBG_OBSERVED("synchronization barrier instruction", OpcodeName);
       }
 
+      if (MI.isIndirectBranch() || (MI.isCall() && MI.getOperand(0).isReg()))
+        DO_SKIP_HELPER(HasIndirect);
+
       // We want to exclude loops with any control flow changing instructions
       // (branches, calls, returns) except for the terminator
       if (MI.isBranch() && !MI.isTerminator())
@@ -778,6 +781,12 @@ SmallVector<MachineBasicBlock *, 4> LoopUnrollASM::findSubLoopBlocks(const Small
                 break;
             }
             return SubLoopBlocksInOrder;
+          }
+          else {  // LastBranch targets non-traversed block
+            if (llvm::find(LoopBlocksInOrder, Target) != LoopBlocksInOrder.end()) {
+              // Target is for a block inside the Loop, return with an empty block
+              return {};
+            }
           }
         }
       }
@@ -1009,8 +1018,6 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   if (BackedgeBranch->isUnconditionalBranch())
     DO_SKIP(BranchUnconditional);
 
-  if (BackedgeBranch->isIndirectBranch())
-    DO_SKIP(BranchIndirect);
   assert(BackedgeBranch->isConditionalBranch() && "Loop with non-conditional backedge branch!");
 
   // Check if this is a single basic block loop (Head == Latch)
