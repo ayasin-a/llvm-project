@@ -98,10 +98,10 @@ static cl::opt<unsigned> LoopUnrollASMMaxBlocks(
     cl::desc("Maximum number of basic blocks in a loop for LoopUnrollASM to process"),
     cl::init(8), cl::Hidden);
 
-static cl::opt<unsigned> LoopUnrollASMMaxOps(
+static cl::list<unsigned> LoopUnrollASMMaxOps(
     "loop-unroll-asm-max-ops",
-    cl::desc("Maximum number of operations in a loop for LoopUnrollASM to process"),
-    cl::init(46), cl::Hidden);
+    cl::desc("Maximum number of operations in a loop for LoopUnrollASM to process (first value: main loops, second value: sub-loops)"),
+    cl::Hidden);
 
 static cl::opt<unsigned> LoopUnrollASMMinBubbles(
     "loop-unroll-asm-min-bubbles",
@@ -948,11 +948,16 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
       MachineBasicBlock *NextBlock = nullptr;
       SmallVector<MachineBasicBlock *, 4> SubLoopBlocks = findSubLoopBlocks(LoopBlocksInOrder, BackwardBranch, NextBlock);
       if (!SubLoopBlocks.empty()) {
-        DBG(4, dbgs() << "    Matched SubLoop pattern\n");
+        DBG(4, dbgs() << "    Found SubLoop pattern candidate\n");
         SmallVector<MachineInstr *, 4> InternalBranches;
         auto OptionalCount = calculateLoopCount(make_range(SubLoopBlocks.begin(), SubLoopBlocks.end()), InternalBranches);
         assert(OptionalCount && "calculateLoopCount should not fail for SubLoop pattern");
-        return processTightLoopWithPattern(BackwardBranch, Simple_SubLoop, NextBlock, false, SubLoopBlocks, *OptionalCount);
+        unsigned maxOpsSubLoop = LoopUnrollASMMaxOps.size() > 1 ? LoopUnrollASMMaxOps[1] : 24;
+        if (OptionalCount < maxOpsSubLoop) {
+          DBG(3, dbgs() << "    Matched SubLoop pattern\n");
+          return processTightLoopWithPattern(BackwardBranch, Simple_SubLoop, NextBlock, false, SubLoopBlocks, *OptionalCount);
+        } else
+          DBG(4, dbgs() << "    Non-small sub-loop of " << OptionalCount << " ops (threshold: " << maxOpsSubLoop << ")\n");
       }
     }
     return std::nullopt;
@@ -1047,9 +1052,10 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   if (!InternalBranches.empty())
     DO_SKIP(HasInternalBranch);
 
-  if (LoopCount >= LoopUnrollASMMaxOps) {
+  unsigned maxOpsMain = LoopUnrollASMMaxOps.empty() ? 46 : LoopUnrollASMMaxOps[0];
+  if (LoopCount >= maxOpsMain) {
     ++NumInnerLoopsTooManyInsts;
-     DBG(4, dbgs() << "  skipping: Too many instructions (" << LoopCount << " >= " << LoopUnrollASMMaxOps << ")\n");
+     DBG(4, dbgs() << "  skipping: Too many instructions (" << LoopCount << " >= " << maxOpsMain << ")\n");
     return Changed;
   }
 
