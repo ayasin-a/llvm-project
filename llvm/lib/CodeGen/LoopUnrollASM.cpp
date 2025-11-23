@@ -775,8 +775,13 @@ SmallVector<MachineBasicBlock *, 4> LoopUnrollASM::findSubLoopBlocks(const Small
             for (MachineBasicBlock *LoopMBB : LoopBlocksInOrder) {
               if (LoopMBB == Target)
                 InRange = true;
-              if (InRange)
+              if (InRange) {
                 SubLoopBlocksInOrder.push_back(LoopMBB);
+                // skip sub-loop with Call.
+                for (MachineInstr &MI : *LoopMBB)
+                  if (MI.isCall())
+                    return {};
+              }
               if (LoopMBB == MBB)
                 break;
             }
