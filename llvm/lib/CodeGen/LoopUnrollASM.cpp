@@ -101,7 +101,7 @@ static cl::opt<unsigned> LoopUnrollASMMaxBlocks(
 static cl::list<unsigned> LoopUnrollASMMaxOps(
     "loop-unroll-asm-max-ops",
     cl::desc("Maximum number of operations in a loop for LoopUnrollASM to process (first value: main loops, second value: sub-loops)"),
-    cl::Hidden);
+    cl::CommaSeparated, cl::Hidden);
 
 static cl::opt<unsigned> LoopUnrollASMMinBubbles(
     "loop-unroll-asm-min-bubbles",
@@ -777,7 +777,7 @@ SmallVector<MachineBasicBlock *, 4> LoopUnrollASM::findSubLoopBlocks(const Small
                 InRange = true;
               if (InRange) {
                 SubLoopBlocksInOrder.push_back(LoopMBB);
-                // skip sub-loop with Call.
+                // skip sub-loop with Call
                 for (MachineInstr &MI : *LoopMBB)
                   if (MI.isCall())
                     return {};
@@ -789,7 +789,7 @@ SmallVector<MachineBasicBlock *, 4> LoopUnrollASM::findSubLoopBlocks(const Small
           }
           else {  // LastBranch targets non-traversed block
             if (llvm::find(LoopBlocksInOrder, Target) != LoopBlocksInOrder.end()) {
-              // Target is for a block inside the Loop, return with an empty block
+              // skip sub-loop when Target is for a block inside the Loop
               return {};
             }
           }
@@ -952,7 +952,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
         SmallVector<MachineInstr *, 4> InternalBranches;
         auto OptionalCount = calculateLoopCount(make_range(SubLoopBlocks.begin(), SubLoopBlocks.end()), InternalBranches);
         assert(OptionalCount && "calculateLoopCount should not fail for SubLoop pattern");
-        unsigned maxOpsSubLoop = LoopUnrollASMMaxOps.size() > 1 ? LoopUnrollASMMaxOps[1] : 24;
+        unsigned maxOpsSubLoop = LoopUnrollASMMaxOps.size() > 1 ? LoopUnrollASMMaxOps[1] : 8;
         if (OptionalCount < maxOpsSubLoop) {
           DBG(3, dbgs() << "    Matched SubLoop pattern\n");
           return processTightLoopWithPattern(BackwardBranch, Simple_SubLoop, NextBlock, false, SubLoopBlocks, *OptionalCount);
