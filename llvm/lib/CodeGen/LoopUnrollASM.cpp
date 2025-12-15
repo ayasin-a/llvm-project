@@ -46,11 +46,6 @@ static cl::opt<bool> LoopUnrollASMAlign(
     cl::desc("Enable alignment-specific analysis"),
     cl::init(true), cl::Hidden);
 
-static cl::opt<bool> LoopUnrollASMAlignAll(
-    "loop-unroll-asm-align-all",
-    cl::desc("Analyze all basic blocks for alignment issues (not just innermost loops)"),
-    cl::init(true), cl::Hidden);
-
 static cl::opt<bool> LoopUnrollASMAlignByDirective(
     "loop-unroll-asm-align-by-directive",
     cl::desc("Enable alignment optimization for FCMP-FCSEL straddling"),
@@ -187,7 +182,6 @@ STATISTIC(NumInnerLoops_HasFcmpFcsel, "Number of inner loops with FCMP-FCSEL pai
 STATISTIC(NumInnerLoops_InvalidUncondExit, "Number of inner loops ending with weird unconditional exit branch");
 STATISTIC(NumInnerLoops_LastInstNotBranch, "Number of inner loops where last instruction is not a branch");
 // alignment pass
-STATISTIC(NumAlignMBBsSkippedNotInnermost, "Number of MBBs skipped (not in innermost loop)");
 STATISTIC(NumAlignmentsSetForStraddle, "Number of alignments set to prevent FCMP+FCSEL cacheline crossings");
 STATISTIC(NumInnermostLoopsAlign8, "Number of innermost loops with 8-byte alignment");
 STATISTIC(NumInnermostLoopsAlign16, "Number of innermost loops with 16-byte alignment");
@@ -1523,14 +1517,12 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
                 << ", IR alignment: " << IRAlignmentValue << "\n");
 
   // Track function alignment statistics
-  if (AlignmentValue != 1 && AlignmentValue != 4) {
-    switch (AlignmentValue) {
-      case 8: ++NumFunctionsAlign8; break;
-      case 16: ++NumFunctionsAlign16; break;
-      case 32: ++NumFunctionsAlign32; break;
-      case 64: ++NumFunctionsAlign64; break;
-      default: ++NumFunctionsAlignOther; break;
-    }
+  switch (AlignmentValue) {
+    case 8: ++NumFunctionsAlign8; break;
+    case 16: ++NumFunctionsAlign16; break;
+    case 32: ++NumFunctionsAlign32; break;
+    case 64: ++NumFunctionsAlign64; break;
+    default: ++NumFunctionsAlignOther; break;
   }
 
   for (MachineLoop *Loop : *MLI) {
@@ -1600,19 +1592,6 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
     MachineInstr* PrevInstr = nullptr;
 
     for (MachineBasicBlock &MBB : MF) {
-      // Skip blocks that are not in innermost loops if LoopUnrollASMAlignAll is off
-      if (!LoopUnrollASMAlignAll) {
-        assert(0 && "LoopUnrollASMAlignAll=0 misses Offset adjustment!");
-        MachineLoop *Loop = MLI->getLoopFor(&MBB);
-        if (!Loop || !Loop->getSubLoops().empty()) {
-          // Skip if not in a loop or not in an innermost loop
-          DBG(5, dbgs() << "Skipping MBB " << MBB.getName()
-                           << " - not in innermost loop\n");
-          ++NumAlignMBBsSkippedNotInnermost;
-          continue;
-        }
-      }
-
       // Reset previous instruction state at start of each MBB to prevent cross-MBB detection
       PrevInstr = nullptr;
 
