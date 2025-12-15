@@ -46,10 +46,10 @@ static cl::opt<bool> LoopUnrollASMAlign(
     cl::desc("Enable alignment-specific analysis"),
     cl::init(true), cl::Hidden);
 
-static cl::opt<bool> LoopUnrollASMAlignByDirective(
-    "loop-unroll-asm-align-by-directive",
-    cl::desc("Enable alignment optimization for FCMP-FCSEL straddling"),
-    cl::init(true), cl::Hidden);
+static cl::opt<unsigned> LoopUnrollASMAlignFcmpFcsel(
+    "loop-unroll-asm-align-fcmp-fcsel",
+    cl::desc("Threshold of Function-alignment to trigger aligning of FCMP-FCSEL straddling"),
+    cl::init(1), cl::Hidden);
 
 static cl::opt<int> LoopUnrollASMAlignThreshold(
     "loop-unroll-asm-align-threshold",
@@ -1562,15 +1562,20 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
   }
 
   // Early exit if requested
-  if (!LoopUnrollASMAlignByDirective)
+  if (!LoopUnrollASMAlignFcmpFcsel)
     return false;
 
-  // Early exit if function alignment <= 4
-  if (AlignmentValue <= 4)
+  // Early exit if function alignment <= threshold
+  if (AlignmentValue <= LoopUnrollASMAlignFcmpFcsel)
     return false;
+
+  if (AlignmentValue < 4) {
+    DBG(2, dbgs() << "   Down-capping AlignmentValue to 4\n");
+    AlignmentValue = 4;
+  }
 
   // Assert that we have a valid alignment
-  assert(AlignmentValue > 4 && AlignmentValue <= 64 &&
+  assert(AlignmentValue >= 4 && AlignmentValue <= 64 &&
          "Function alignment must be between 8 and 64 bytes (powers of 2)");
   assert(isPowerOf2_32(AlignmentValue) &&
          "Function alignment must be a power of 2");
@@ -1671,9 +1676,7 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
             }
 
             // Calculate minimum alignment to prevent FCMP-FCSEL straddling
-            // FCMP+FCSEL need 8 bytes total, cacheline is 16 bytes
-            // Use 16-byte alignment to ensure proper placement
-            unsigned RequiredAlign = 16;
+            unsigned RequiredAlign = 8;
             unsigned CurrentAlign = AlignTarget->getAlignment().value();
 
             if (CurrentAlign < RequiredAlign) {
