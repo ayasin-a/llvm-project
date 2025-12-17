@@ -1660,13 +1660,7 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
             MachineLoop *CurrentLoop = MLI->getLoopFor(&MBB);
             if (CurrentLoop && CurrentLoop->getSubLoops().empty()) {
               // MBB is in an innermost loop - align first BB in layout
-              AlignTarget = nullptr;
-              for (MachineBasicBlock &LayoutMBB : MF)
-                if (CurrentLoop->contains(&LayoutMBB)) {
-                  AlignTarget = &LayoutMBB;
-                  break;
-                }
-              // FirstBBInLayout must always be found at this point
+              AlignTarget = CurrentLoop->getTopBlock();
               assert(AlignTarget && "First BB In Layout order must be found for inner-most loop");
               DBG(6, dbgs() << "  Setting alignment on first loop BB in layout order BB"
                             << AlignTarget->getNumber() << " (header: BB" << CurrentLoop->getHeader()->getNumber() << ")\n");
