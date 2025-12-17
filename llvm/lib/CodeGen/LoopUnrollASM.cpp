@@ -256,6 +256,8 @@ private:
   static void debugPrintLoopInfo(const MachineLoop *Loop, StringRef Prefix,
                           const SmallVectorImpl<MachineBasicBlock *> &Blocks,
                           MachineBasicBlock *ExitBlock = nullptr);
+  static void debugPrintLoopInfo(const MachineLoop *Loop, StringRef Prefix,
+                          MachineBasicBlock *ExitBlock = nullptr);
   static MachineInstr* findLoopBackedgeBranch(const MachineLoop* Loop);
   bool processLoop(MachineLoop *Loop, MachineFunction &MF);
   bool processTightLoop(MachineLoop *Loop, MachineBasicBlock *Header, unsigned LoopCount,
@@ -804,13 +806,7 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
     Changed |= processLoop(SubLoop, MF);
   }
 
-  DBG(3, {
-    SmallVector<MachineBasicBlock *, 4> LoopBlocksInOrder;
-    for (MachineBasicBlock &MBB : MF)
-      if (Loop->contains(&MBB))
-        LoopBlocksInOrder.push_back(&MBB);
-    debugPrintLoopInfo(Loop, " Examining", LoopBlocksInOrder);
-  });
+  DBG(3, { debugPrintLoopInfo(Loop, " Examining"); });
   // Only process innermost loops
   if (!Loop->getSubLoops().empty()) {
     DBG_SKIP("non-innermost");
@@ -1057,6 +1053,16 @@ bool LoopUnrollASM::processLoop(MachineLoop *Loop, MachineFunction &MF) {
   unsigned AdjustedLoopCount = lastUnconditionalExitBranch ? LoopCount - 1 : LoopCount;
 
   return processTightLoopWithPattern(BackedgeBranch, Pattern, ExitBlock, lastUnconditionalExitBranch != nullptr, LoopBlocksInOrder, AdjustedLoopCount);
+}
+
+void LoopUnrollASM::debugPrintLoopInfo(const MachineLoop *Loop,
+                                       StringRef Prefix,
+                                       MachineBasicBlock *ExitBlock) {
+  SmallVector<MachineBasicBlock *, 4> LoopBlocksInOrder;
+  for (MachineBasicBlock &MBB : *Loop->getHeader()->getParent())
+    if (Loop->contains(&MBB))
+      LoopBlocksInOrder.push_back(&MBB);
+  debugPrintLoopInfo(Loop, Prefix, LoopBlocksInOrder, ExitBlock);
 }
 
 void LoopUnrollASM::debugPrintLoopInfo(const MachineLoop *Loop,
@@ -1653,24 +1659,17 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
 
             MachineLoop *CurrentLoop = MLI->getLoopFor(&MBB);
             if (CurrentLoop && CurrentLoop->getSubLoops().empty()) {
-              // MBB is in an innermost loop - align first BB in layout order for better I-cache alignment
-
-              MachineBasicBlock *LoopHeader = CurrentLoop->getHeader();
-              MachineBasicBlock *FirstBBInLayout = nullptr;
-
-              // Find first loop block in layout order
-              for (MachineBasicBlock &LayoutMBB : MF) {
+              // MBB is in an innermost loop - align first BB in layout
+              AlignTarget = nullptr;
+              for (MachineBasicBlock &LayoutMBB : MF)
                 if (CurrentLoop->contains(&LayoutMBB)) {
-                  FirstBBInLayout = &LayoutMBB;
+                  AlignTarget = &LayoutMBB;
                   break;
                 }
-              }
-
-              // FirstBBInLayout must always be found since CurrentLoop is non-empty
-              assert(FirstBBInLayout && "FirstBBInLayout must be found for non-empty loop");
-              AlignTarget = FirstBBInLayout;
+              // FirstBBInLayout must always be found at this point
+              assert(AlignTarget && "First BB In Layout order must be found for inner-most loop");
               DBG(6, dbgs() << "  Setting alignment on first loop BB in layout order BB"
-                            << AlignTarget->getNumber() << " (header: BB" << LoopHeader->getNumber() << ")\n");
+                            << AlignTarget->getNumber() << " (header: BB" << CurrentLoop->getHeader()->getNumber() << ")\n");
             } else {
               DBG(6, dbgs() << "  Setting alignment on MBB " << AlignTarget->getNumber() << "\n");
             }
