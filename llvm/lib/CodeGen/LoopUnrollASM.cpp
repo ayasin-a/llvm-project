@@ -1599,22 +1599,24 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
 
   for (unsigned FuncStartOffset = 0; FuncStartOffset < 64; FuncStartOffset += AlignmentValue) {
     // Reset state for each FuncStartOffset iteration
-    unsigned CurrentIndex = 0;
+    unsigned CurrentIndex = 0; // in bytes
     MachineInstr* PrevInstr = nullptr;
+    unsigned PrevInstrOffset = 0; // track offset of previous instruction
 
     for (MachineBasicBlock &MBB : MF) {
       // Reset previous instruction state at start of each MBB to prevent cross-MBB detection
       PrevInstr = nullptr;
+      PrevInstrOffset = 0;
 
       // Handle MBB alignment by adjusting CurrentIndex for alignment padding
       if (unsigned MBBAlign = MBB.getAlignment().value(); MBBAlign > 4) {
         // Calculate potential padding due to MBB alignment
-        // CurrentIndex is in 4-byte instruction units, convert to bytes for alignment calc
-        unsigned CurrentByteOffset = CurrentIndex * 4 + FuncStartOffset;
+        // CurrentIndex is in bytes
+        unsigned CurrentByteOffset = CurrentIndex + FuncStartOffset;
         unsigned AlignedOffset = alignTo(CurrentByteOffset, MBBAlign);
         unsigned PaddingBytes = AlignedOffset - CurrentByteOffset;
-        // Convert padding back to instruction units (divide by 4)
-        CurrentIndex += (PaddingBytes / 4);
+        // Add padding in bytes
+        CurrentIndex += PaddingBytes;
         DBG(6, dbgs() << "  MBB " << MBB.getNumber() << " has " << MBBAlign
                       << "-byte alignment, added " << (PaddingBytes / 4)
                       << " instruction slots for padding\n");
@@ -1627,7 +1629,7 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
         if (MI.isDebugInstr() || MI.isPseudo())
           continue;
 
-        DBG(8, dbgs() << "     InstOffset=" << (CurrentIndex + FuncStartOffset / 4)
+        DBG(8, dbgs() << "     InstOffset=" << ((CurrentIndex + FuncStartOffset) / 4)
                       << " BB=" << MBB.getNumber()
                       << " FuncOffset=" << FuncStartOffset
                       << " " << MI);
@@ -1635,11 +1637,11 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
         StringRef OpcodeName = TII->getName(MI.getOpcode());
 
         // Check if previous instruction was FCMP and current is FCSEL
-        if (PrevInstr && (CurrentIndex % 2) == 0 && OpcodeName.starts_with("FCSEL")
+        if (PrevInstr && OpcodeName.starts_with("FCSEL")
             && TII->getName(PrevInstr->getOpcode()).starts_with("FCMP")) {
           // Calculate actual offsets including function start offset
-          unsigned FCMPActualOffset = (CurrentIndex - 1) * 4 + FuncStartOffset;
-          unsigned FCSELActualOffset = CurrentIndex * 4 + FuncStartOffset;
+          unsigned FCMPActualOffset = PrevInstrOffset + FuncStartOffset;
+          unsigned FCSELActualOffset = CurrentIndex + FuncStartOffset;
 
           // Check if FCMP and FCSEL cross cacheline boundaries (cacheline is offset / 16)
           if ((FCMPActualOffset / 16) != (FCSELActualOffset / 16)) {
@@ -1689,8 +1691,9 @@ bool LoopUnrollASM::analyzeMachineInsts(MachineFunction &MF) {
 
         // Update previous instruction info for next iteration
         PrevInstr = &MI;
+        PrevInstrOffset = CurrentIndex;
 
-        CurrentIndex += 1; // Increment by 1 instruction (multiply by 4 for byte offset when needed)
+        CurrentIndex += TII->getInstSizeInBytes(MI); // Increment by instruction size
       } // for MachineInstr
     } // for MachineBasicBlock
 
