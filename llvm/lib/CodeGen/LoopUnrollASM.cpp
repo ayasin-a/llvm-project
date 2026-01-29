@@ -251,7 +251,7 @@ private:
 
   bool isCompareBranchFusion(const MachineInstr *CompareInst, const MachineInstr *BranchInst);
   bool isPostIndexMemOp(const MachineInstr &MI);
-  bool isLoadStorePair(const MachineInstr &MI);
+  bool isLoadPair(const MachineInstr &MI);
   static bool isLoopSimplifyForm(const MachineLoop *Loop);
   static void debugPrintLoopInfo(const MachineLoop *Loop, StringRef Prefix,
                           const SmallVectorImpl<MachineBasicBlock *> &Blocks,
@@ -534,28 +534,24 @@ bool LoopUnrollASM::isPostIndexMemOp(const MachineInstr &MI) {
   return isPostIndex;
 }
 
-/// Check if a memory operation is a load-pair or store-pair instruction.
-/// Load/store pair instructions operate on two registers and are counted with weight 2.
-/// Returns true if the instruction is a load-pair or store-pair operation.
-bool LoopUnrollASM::isLoadStorePair(const MachineInstr &MI) {
+/// Check if a memory operation is a load-pair instruction.
+/// Load pair instructions operate on two registers and are counted with weight 2.
+/// Returns true if the instruction is a load-pair operation.
+bool LoopUnrollASM::isLoadPair(const MachineInstr &MI) {
   if (!MI.mayLoadOrStore() || MI.isTerminator())
     return false;
 
   // Get the opcode name to check for pair patterns
   StringRef OpcodeName = TII->getName(MI.getOpcode());
 
-  // Common patterns for load/store pair instructions on AArch64
+  // Common patterns for load pair instructions on AArch64
   // LDP - Load Pair of Registers
-  // STP - Store Pair of Registers
   // LDNP - Load Pair Non-temporal
-  // STNP - Store Pair Non-temporal
   bool isPairOp = OpcodeName.starts_with("LDP") ||   // LDP variants (LDPWi, LDPXi, LDPSi, LDPDi, LDPQi, etc.)
-                  OpcodeName.starts_with("STP") ||   // STP variants (STPWi, STPXi, STPSi, STPDi, STPQi, etc.)
-                  OpcodeName.starts_with("LDNP") ||  // LDNP variants (LDNPWi, LDNPXi, LDNPSi, LDNPDi, LDNPQi, etc.)
-                  OpcodeName.starts_with("STNP");    // STNP variants (STNPWi, STNPXi, STNPSi, STNPDi, STNPQi, etc.)
+                  OpcodeName.starts_with("LDNP");    // LDNP variants (LDNPWi, LDNPXi, LDNPSi, LDNPDi, LDNPQi, etc.)
 
   if (isPairOp) {
-    DBG_OBSERVED("load/store pair instruction", OpcodeName);
+    DBG_OBSERVED("load pair instruction", OpcodeName);
   }
 
   return isPairOp;
@@ -652,8 +648,8 @@ std::optional<unsigned> LoopUnrollASM::calculateLoopCount(const iterator_range<M
       else if (isPostIndexMemOp(MI))
         // Post-index operations translate into 2 operations
         ++LoopCount;
-      if (isLoadStorePair(MI))
-        // Load/store pair instructions translate into 2 operations (orthogonal to Post-Index)
+      if (isLoadPair(MI))
+        // Load pair instructions translate into 2 operations (orthogonal to Post-Index)
         ++LoopCount;
 
       // Lambda to check if OpcodeName starts with any of the given mnemonics
