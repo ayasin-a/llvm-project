@@ -237,6 +237,8 @@ static bool isAddressLdStPair(const MachineInstr *FirstMI,
 }
 
 /// Compare and conditional select.
+/// Handles CMP (SUBS with WZR dest) and CMN (ADDS with WZR dest), 32-bit only.
+/// Immediate variants require no LSL shift and imm <= 15.
 static bool isCmpCSelPair(const MachineInstr *FirstMI,
                           const MachineInstr &SecondMI) {
   // 32 bits
@@ -248,31 +250,17 @@ static bool isCmpCSelPair(const MachineInstr *FirstMI,
     if (FirstMI->definesRegister(AArch64::WZR, /*TRI=*/nullptr))
       switch (FirstMI->getOpcode()) {
       case AArch64::SUBSWrs:
+      case AArch64::ADDSWrs:
         return !AArch64InstrInfo::hasShiftedReg(*FirstMI);
       case AArch64::SUBSWrx:
         return !AArch64InstrInfo::hasExtendedReg(*FirstMI);
       case AArch64::SUBSWrr:
+      case AArch64::ADDSWrr:
+        return true;
       case AArch64::SUBSWri:
-        return true;
-      }
-  }
-
-  // 64 bits
-  if (SecondMI.getOpcode() == AArch64::CSELXr) {
-    // Assume the 1st instr to be a wildcard if it is unspecified.
-    if (FirstMI == nullptr)
-      return true;
-
-    if (FirstMI->definesRegister(AArch64::XZR, /*TRI=*/nullptr))
-      switch (FirstMI->getOpcode()) {
-      case AArch64::SUBSXrs:
-        return !AArch64InstrInfo::hasShiftedReg(*FirstMI);
-      case AArch64::SUBSXrx:
-      case AArch64::SUBSXrx64:
-        return !AArch64InstrInfo::hasExtendedReg(*FirstMI);
-      case AArch64::SUBSXrr:
-      case AArch64::SUBSXri:
-        return true;
+      case AArch64::ADDSWri:
+        return FirstMI->getOperand(3).getImm() == 0 &&
+               FirstMI->getOperand(2).getImm() <= 15;
       }
   }
 
