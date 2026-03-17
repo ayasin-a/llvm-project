@@ -252,7 +252,7 @@ LLVMInitializeAArch64Target() {
   initializeAArch64CollectLOHLegacyPass(PR);
   initializeAArch64CompressJumpTablesLegacyPass(PR);
   initializeAArch64ConditionalComparesPass(PR);
-  initializeAArch64ConditionOptimizerPass(PR);
+  initializeAArch64ConditionOptimizerLegacyPass(PR);
   initializeAArch64DeadRegisterDefinitionsPass(PR);
   initializeAArch64ExpandPseudoPass(PR);
   initializeAArch64LoadStoreOptLegacyPass(PR);
@@ -818,7 +818,7 @@ void AArch64PassConfig::addMachineSSAOptimization() {
 
 bool AArch64PassConfig::addILPOpts() {
   if (EnableCondOpt)
-    addPass(createAArch64ConditionOptimizerPass());
+    addPass(createAArch64ConditionOptimizerLegacyPass());
   if (EnableCCMP)
     addPass(createAArch64ConditionalCompares());
   if (EnableMCR)
