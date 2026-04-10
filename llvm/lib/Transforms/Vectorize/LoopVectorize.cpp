@@ -873,7 +873,8 @@ static void reportVectorization(OptimizationRemarkEmitter *ORE, Loop *TheLoop,
                               TheLoop->getHeader())
            << "vectorized " << LoopType << "loop (vectorization width: "
            << ore::NV("VectorizationFactor", VF.Width)
-           << ", interleaved count: " << ore::NV("InterleaveCount", IC) << ")";
+           << ", interleaved count: " << ore::NV("InterleaveCount", IC)
+           << ", loop cost: " << ore::NV("LoopCost", VF.Cost) << ")";
   });
 }
 
