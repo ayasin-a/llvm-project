@@ -5205,8 +5205,11 @@ static bool isLoopSizeWithinBudget(Loop *L, const AArch64TTIImpl &TTI,
         return false;
 
       LoopCost += Cost;
-      if (LoopCost > Budget)
+      if (LoopCost > Budget) {
+        if (FinalSize)
+          *FinalSize = LoopCost.getValue();
         return false;
+      }
     }
   }
 
@@ -5336,6 +5339,7 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
     unsigned Width = 10;
     if (!isLoopSizeWithinBudget(L, TTI, Width, &Size)) {
       UP.UnrollSkipReason = "runtime-Apple: loop size exceeds budget (" +
+                            std::to_string(Size) + " > " +
                             std::to_string(Width) + ")";
       return;
     }
