@@ -5219,7 +5219,8 @@ static bool isLoopSizeWithinBudget(Loop *L, const AArch64TTIImpl &TTI,
 }
 
 static bool shouldUnrollMultiExitLoop(Loop *L, ScalarEvolution &SE,
-                                      const AArch64TTIImpl &TTI) {
+                                      const AArch64TTIImpl &TTI,
+                                      const unsigned SizeBudget = 5) {
   // Only consider loops with unknown trip counts for which we can determine
   // a symbolic expression. Multi-exit loops with small known trip counts will
   // likely be unrolled anyway.
@@ -5233,8 +5234,8 @@ static bool shouldUnrollMultiExitLoop(Loop *L, ScalarEvolution &SE,
   if (MaxTC > 0 && MaxTC <= 32)
     return false;
 
-  // Make sure the loop size is <= 5.
-  if (!isLoopSizeWithinBudget(L, TTI, 5, nullptr))
+  // Make sure the loop size is small.
+  if (!isLoopSizeWithinBudget(L, TTI, SizeBudget, nullptr))
     return false;
 
   // Small search loops with multiple exits can be highly beneficial to unroll.
@@ -5493,7 +5494,8 @@ void AArch64TTIImpl::getUnrollingPreferences(
 
   // If this is a small, multi-exit loop similar to something like std::find,
   // then there is typically a performance improvement achieved by unrolling.
-  if (!L->getExitBlock() && shouldUnrollMultiExitLoop(L, SE, *this)) {
+  if (!L->getExitBlock() &&
+      shouldUnrollMultiExitLoop(L, SE, *this, ST->isAppleMLike() ? 10 : 5)) {
     UP.UnrollSkipReason.clear();
     UP.RuntimeUnrollMultiExit = true;
     UP.Runtime = true;
