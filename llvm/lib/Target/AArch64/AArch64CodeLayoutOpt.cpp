@@ -22,6 +22,7 @@
 #include "AArch64Subtarget.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -35,14 +36,17 @@ using namespace llvm;
 enum CodeLayoutOpt {
   FcmpFcsel, // FCMP-FCSEL code layout optimization (requires hasFuseFCmpFCSel)
   CmpCsel,   // CMP-CSEL code layout optimization (requires hasFuseCmpCSel)
+  PageCross, // Page-cross alignment for large nested-loop functions
 };
 
 static cl::bits<CodeLayoutOpt> EnableCodeAlignment(
     "aarch64-code-layout-opt", cl::Hidden, cl::CommaSeparated,
     cl::desc("Enable code alignment optimization for instruction pairs"),
-    cl::values(clEnumValN(FcmpFcsel, "fcmp-fcsel", "FCMP-FCSEL pair alignment"),
-               clEnumValN(CmpCsel, "cmp-csel",
-                          "CMP/CMN-CSEL pair alignment (32-bit)")));
+    cl::values(
+        clEnumValN(FcmpFcsel, "fcmp-fcsel", "FCMP-FCSEL pair alignment"),
+        clEnumValN(CmpCsel, "cmp-csel", "CMP/CMN-CSEL pair alignment (32-bit)"),
+        clEnumValN(PageCross, "page-cross",
+                   "Page-cross alignment for large nested-loop functions")));
 
 static cl::opt<unsigned> FunctionAlignBytes(
     "aarch64-code-layout-opt-align-functions", cl::Hidden,
@@ -54,12 +58,23 @@ static cl::opt<unsigned> FunctionAlignBytes(
             "aarch64-code-layout-opt-align must be a power of 2");
     }));
 
+static cl::opt<unsigned> PageCrossMinInsns(
+    "aarch64-code-layout-opt-page-cross-min-insns", cl::Hidden,
+    cl::desc("Minimum instruction count for page-cross alignment"),
+    cl::init(350));
+
+static cl::opt<unsigned> PageCrossMinDepth(
+    "aarch64-code-layout-opt-page-cross-min-depth", cl::Hidden,
+    cl::desc("Minimum loop nest depth for page-cross alignment"), cl::init(2));
+
 STATISTIC(NumFunctionsAligned,
           "Number of functions with aligned (to 64-bytes by default)");
 STATISTIC(NumFcmpFcselPairsDetected,
           "Number of FCMP-FCSEL pairs detected for alignment");
 STATISTIC(NumCmpCselPairsDetected,
           "Number of CMP/CMN-CSEL pairs detected for alignment");
+STATISTIC(NumPageCrossAligned,
+          "Number of functions page-aligned for page-cross optimization");
 
 namespace {
 
@@ -75,9 +90,13 @@ public:
 
 private:
   const AArch64InstrInfo *TII = nullptr;
+  MachineLoopInfo *MLI = nullptr;
 
   // Returns true if MBB contains at least one layout-sensitive pattern.
   bool detectLayoutSensitivePattern(MachineBasicBlock *MBB);
+
+  // Returns the page-cross alignment in bytes, or 0 if criteria not met.
+  unsigned getPageCrossAlignment(MachineFunction &MF);
 
   bool optimizeForCodeLayout(MachineFunction &MF);
 };
@@ -91,6 +110,7 @@ INITIALIZE_PASS(AArch64CodeLayoutOpt, "aarch64-code-layout-opt",
 
 void AArch64CodeLayoutOpt::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.setPreservesAll();
+  AU.addRequired<MachineLoopInfoWrapperPass>();
   MachineFunctionPass::getAnalysisUsage(AU);
 }
 
@@ -161,10 +181,14 @@ bool AArch64CodeLayoutOpt::runOnMachineFunction(MachineFunction &MF) {
 
   const auto *Subtarget = &MF.getSubtarget<AArch64Subtarget>();
   TII = Subtarget->getInstrInfo();
+  MLI = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
 
-  if (!(EnableCodeAlignment.isSet(FcmpFcsel) &&
-        Subtarget->hasFuseFCmpFCSel()) &&
-      !(EnableCodeAlignment.isSet(CmpCsel) && Subtarget->hasFuseCmpCSel()))
+  bool HasPairOpt =
+      (EnableCodeAlignment.isSet(FcmpFcsel) && Subtarget->hasFuseFCmpFCSel()) ||
+      (EnableCodeAlignment.isSet(CmpCsel) && Subtarget->hasFuseCmpCSel());
+  bool HasPageCross = EnableCodeAlignment.isSet(PageCross);
+
+  if (!HasPairOpt && !HasPageCross)
     return false;
 
   return optimizeForCodeLayout(MF);
@@ -210,9 +234,64 @@ bool AArch64CodeLayoutOpt::detectLayoutSensitivePattern(
   return false;
 }
 
+/// Returns the maximum loop nest depth across all loops in the function.
+static unsigned getMaxLoopDepth(MachineLoopInfo *MLI) {
+  unsigned MaxDepth = 0;
+  for (MachineLoop *L : *MLI)
+    for (MachineLoop *Sub : L->getLoopsInPreorder())
+      MaxDepth = std::max(MaxDepth, Sub->getLoopDepth());
+  return MaxDepth;
+}
+
+unsigned AArch64CodeLayoutOpt::getPageCrossAlignment(MachineFunction &MF) {
+  unsigned InsnCount = 0;
+  unsigned SizeInBytes = 0;
+  for (auto &MBB : MF)
+    for (auto &MI : instructionsWithoutDebug(MBB.begin(), MBB.end())) {
+      ++InsnCount;
+      SizeInBytes += TII->getInstSizeInBytes(MI);
+    }
+
+  if (InsnCount <= PageCrossMinInsns || InsnCount >= 1100) {
+    LLVM_DEBUG(dbgs() << DEBUG_TYPE ": page-cross: " << MF.getName()
+                      << " instruction count " << InsnCount
+                      << " outside range (" << PageCrossMinInsns
+                      << ", 1100)\n");
+    return 0;
+  }
+
+  unsigned MaxDepth = getMaxLoopDepth(MLI);
+  if (MaxDepth < PageCrossMinDepth) {
+    LLVM_DEBUG(dbgs() << DEBUG_TYPE ": page-cross: " << MF.getName()
+                      << " max loop depth " << MaxDepth << " < "
+                      << PageCrossMinDepth << "\n");
+    return 0;
+  }
+
+  unsigned AlignBytes = NextPowerOf2(SizeInBytes - 1);
+  LLVM_DEBUG(dbgs() << DEBUG_TYPE ": page-cross: " << MF.getName()
+                    << " qualifies (insns=" << InsnCount
+                    << ", size=" << SizeInBytes << ", depth=" << MaxDepth
+                    << ", align=" << AlignBytes << ")\n");
+  return AlignBytes;
+}
+
 bool AArch64CodeLayoutOpt::optimizeForCodeLayout(MachineFunction &MF) {
   LLVM_DEBUG(dbgs() << DEBUG_TYPE ": optimizeForCodeLayout: " << MF.getName()
                     << "\n");
+
+  // Check page-cross alignment first (higher alignment takes precedence).
+  if (EnableCodeAlignment.isSet(PageCross)) {
+    unsigned AlignBytes = getPageCrossAlignment(MF);
+    if (AlignBytes && MF.getAlignment() < Align(AlignBytes)) {
+      MF.setAlignment(Align(AlignBytes));
+      ++NumPageCrossAligned;
+      LLVM_DEBUG(dbgs() << DEBUG_TYPE ": Set " << AlignBytes
+                        << "-byte alignment for function " << MF.getName()
+                        << "\n");
+      return true;
+    }
+  }
 
   for (auto &MBB : MF) {
     if (!detectLayoutSensitivePattern(&MBB))
