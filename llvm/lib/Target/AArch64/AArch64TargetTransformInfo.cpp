@@ -81,6 +81,10 @@ static cl::opt<int> Aarch64ForceUnrollThreshold(
     "aarch64-force-unroll-threshold", cl::init(0), cl::Hidden,
     cl::desc("Threshold for forced unrolling of small loops in AArch64"));
 
+static cl::opt<unsigned> MultiExitUnrollSizeBudget(
+    "aarch64-multi-exit-unroll-budget", cl::init(5), cl::Hidden,
+    cl::desc("Size budget for multi-exit loop unrolling"));
+
 namespace {
 class TailFoldingOption {
   // These bitfields will only ever be set to something non-zero in operator=,
@@ -5495,7 +5499,7 @@ void AArch64TTIImpl::getUnrollingPreferences(
   // If this is a small, multi-exit loop similar to something like std::find,
   // then there is typically a performance improvement achieved by unrolling.
   if (!L->getExitBlock() &&
-      shouldUnrollMultiExitLoop(L, SE, *this, ST->isAppleMLike() ? 10 : 5)) {
+      shouldUnrollMultiExitLoop(L, SE, *this, MultiExitUnrollSizeBudget)) {
     UP.UnrollSkipReason.clear();
     UP.RuntimeUnrollMultiExit = true;
     UP.Runtime = true;
