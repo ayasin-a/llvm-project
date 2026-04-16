@@ -41,10 +41,10 @@ using namespace llvm;
 
 #define DEBUG_TYPE "loop-unroll-asm"
 
-static cl::opt<bool> LoopUnrollASMAlign(
-    "loop-unroll-asm-align",
-    cl::desc("Enable alignment-specific analysis"),
-    cl::init(true), cl::Hidden);
+static cl::opt<bool>
+    LoopUnrollASMAlign("loop-unroll-asm-align",
+                       cl::desc("Enable alignment-specific analysis"),
+                       cl::init(false), cl::Hidden);
 
 static cl::opt<unsigned> LoopUnrollASMAlignFcmpFcsel(
     "loop-unroll-asm-align-fcmp-fcsel",
@@ -80,8 +80,9 @@ static cl::opt<unsigned> LoopUnrollASMDebug(
 static cl::opt<unsigned> LoopUnrollASMEnable(
     "loop-unroll-asm-enable",
     cl::desc("Bitmask to enable each pattern in LoopUnrollASM "
-             "(bit 0: One_Backedge, bit 1: Two_Backedge_Uncond, bit 2: Multi_CondExit_Backedge, bit 3: Simple_SubLoop)"),
-    cl::init(0xb), cl::Hidden);
+             "(bit 0: One_Backedge, bit 1: Two_Backedge_Uncond, bit 2: "
+             "Multi_CondExit_Backedge, bit 3: Simple_SubLoop)"),
+    cl::init(0), cl::Hidden);
 
 static cl::opt<float> LoopUnrollASMFetchBubblesThreshold(
     "loop-unroll-asm-fetch-bubbles-threshold",
