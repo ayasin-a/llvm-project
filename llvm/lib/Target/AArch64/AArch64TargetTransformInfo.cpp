@@ -5188,6 +5188,25 @@ getFalkorUnrollingPreferences(Loop *L, ScalarEvolution &SE,
   }
 }
 
+/// Compute the total code-size cost of a loop. Returns None if any
+/// instruction has an invalid cost.
+static std::optional<unsigned> getLoopSize(Loop *L, const AArch64TTIImpl &TTI) {
+  InstructionCost LoopCost = 0;
+  for (auto *BB : L->getBlocks()) {
+    for (auto &I : *BB) {
+      SmallVector<const Value *, 4> Operands(I.operand_values());
+      InstructionCost Cost =
+          TTI.getInstructionCost(&I, Operands, TTI::TCK_CodeSize);
+      // This can happen with intrinsics that don't currently have a cost model
+      // or for some operations that require SVE.
+      if (!Cost.isValid())
+        return std::nullopt;
+      LoopCost += Cost;
+    }
+  }
+  return LoopCost.getValue();
+}
+
 // This function returns true if the loop:
 //  1. Has a valid cost, and
 //  2. Has a cost within the supplied budget.
@@ -5340,14 +5359,16 @@ getAppleRuntimeUnrollPreferences(Loop *L, ScalarEvolution &SE,
   BasicBlock *Latch = L->getLoopLatch();
   if (Header == Latch) {
     // Estimate the size of the loop.
-    unsigned Size;
     unsigned Width = 10;
-    if (!isLoopSizeWithinBudget(L, TTI, Width, &Size)) {
-      UP.UnrollSkipReason = "runtime-Apple: loop size exceeds budget (" +
-                            std::to_string(Size) + " > " +
-                            std::to_string(Width) + ")";
+    auto MaybeSize = getLoopSize(L, TTI);
+    if (!MaybeSize || *MaybeSize > Width) {
+      UP.UnrollSkipReason =
+          "runtime-Apple: loop size exceeds budget (" +
+          (MaybeSize ? std::to_string(*MaybeSize) : std::string("?")) + " > " +
+          std::to_string(Width) + ")";
       return;
     }
+    unsigned Size = *MaybeSize;
 
     // Try to find an unroll count that maximizes the use of the instruction
     // window, i.e. trying to fetch as many instructions per cycle as possible.
