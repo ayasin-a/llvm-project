@@ -935,6 +935,11 @@ TargetTransformInfo::getMaxInterleaveFactor(ElementCount VF,
   return TTIImpl->getMaxInterleaveFactor(VF, HasUnorderedReductions);
 }
 
+unsigned
+TargetTransformInfo::getTinyLoopInterleaveBoost(unsigned LoopCost) const {
+  return TTIImpl->getTinyLoopInterleaveBoost(LoopCost);
+}
+
 TargetTransformInfo::OperandValueInfo
 TargetTransformInfo::getOperandInfo(const Value *V) {
   OperandValueKind OpInfo = OK_AnyValue;

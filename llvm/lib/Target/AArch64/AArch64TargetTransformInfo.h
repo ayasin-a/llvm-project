@@ -174,6 +174,8 @@ public:
   unsigned getMaxInterleaveFactor(ElementCount VF,
                                   bool HasUnorderedReductions) const override;
 
+  unsigned getTinyLoopInterleaveBoost(unsigned LoopCost) const override;
+
   bool prefersVectorizedAddressing() const override;
 
   /// Check whether Opcode1 has less throughput according to the scheduling

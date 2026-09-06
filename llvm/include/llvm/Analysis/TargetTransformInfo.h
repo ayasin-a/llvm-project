@@ -1513,6 +1513,12 @@ public:
   LLVM_ABI unsigned getMaxInterleaveFactor(ElementCount VF,
                                            bool HasUnorderedReductions) const;
 
+  /// \return A multiplier to apply to the target's usual max interleave
+  /// factor for a loop whose vectorized body has estimated cost \p LoopCost.
+  /// Returns 1 (no boost) by default; targets may raise this for tiny loop
+  /// bodies with headroom to spare.
+  LLVM_ABI unsigned getTinyLoopInterleaveBoost(unsigned LoopCost) const;
+
   /// Collect properties of V used in cost analysis, e.g. OP_PowerOf2.
   LLVM_ABI static OperandValueInfo getOperandInfo(const Value *V);
 

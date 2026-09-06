@@ -82,6 +82,10 @@ static cl::opt<int> Aarch64ForceUnrollThreshold(
     "aarch64-force-unroll-threshold", cl::init(0), cl::Hidden,
     cl::desc("Threshold for forced unrolling of small loops in AArch64"));
 
+static cl::opt<unsigned> TinyLoopInterleaveThreshold(
+    "aarch64-tiny-loop-interleave-threshold", cl::init(6), cl::Hidden,
+    cl::desc("Loop cost threshold below which to boost interleave factor"));
+
 namespace {
 class TailFoldingOption {
   // These bitfields will only ever be set to something non-zero in operator=,
@@ -5857,6 +5861,13 @@ AArch64TTIImpl::getMaxInterleaveFactor(ElementCount VF,
   if (VF.isScalar() || (HasUnorderedReductions && VF.getKnownMinValue() <= 4))
     return 4;
   return ST->getMaxInterleaveFactor();
+}
+
+unsigned AArch64TTIImpl::getTinyLoopInterleaveBoost(unsigned LoopCost) const {
+  if (!LoopCost || !ST->isAppleMLike() ||
+      LoopCost > TinyLoopInterleaveThreshold)
+    return 1;
+  return LoopCost <= TinyLoopInterleaveThreshold / 2 ? 4 : 2;
 }
 
 // For Falkor, we want to avoid having too many strided loads in a loop since

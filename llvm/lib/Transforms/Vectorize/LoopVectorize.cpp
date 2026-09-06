@@ -293,6 +293,15 @@ static cl::opt<unsigned> SmallLoopCost(
     cl::desc(
         "The cost of a loop that is considered 'small' by the interleaver."));
 
+// A multiplier applied on top of the target's usual max interleave factor
+// for tiny loop bodies. 0 (the default) means "ask the target via
+// TTI.getTinyLoopInterleaveBoost()"; an explicit value on the command line
+// overrides the target's answer.
+static cl::opt<unsigned> TinyLoopInterleaveBoost(
+    "vectorizer-tiny-loop-interleave-boost", cl::init(0), cl::Hidden,
+    cl::desc("Override the target-supplied interleave-factor multiplier for "
+             "tiny loop bodies (0 = use the target's default)"));
+
 static cl::opt<bool> LoopVectorizeWithBlockFrequency(
     "loop-vectorize-with-block-frequency", cl::init(true), cl::Hidden,
     cl::desc("Enable the use of the block frequency analysis to access PGO "
@@ -3676,6 +3685,23 @@ LoopVectorizationPlanner::selectInterleaveCount(VPlan &Plan, ElementCount VF,
       TTI.getMaxInterleaveFactor(VF, HasUnorderedReductions);
   LLVM_DEBUG(dbgs() << "LV: MaxInterleaveFactor for the target is "
                     << MaxInterleaveCount << "\n");
+
+  // For tiny loop bodies, some targets can profitably interleave beyond
+  // their usual cap to make better use of spare store/load port throughput.
+  // The register-pressure-derived IC computed below still gates the final
+  // choice, so this only has an effect when there is genuine headroom to
+  // spare.
+  unsigned TinyLoopBoost =
+      TinyLoopInterleaveBoost.getNumOccurrences() > 0
+          ? TinyLoopInterleaveBoost
+          : TTI.getTinyLoopInterleaveBoost(
+                static_cast<unsigned>(LoopCost.getValue()));
+  if (TinyLoopBoost > 1) {
+    MaxInterleaveCount *= TinyLoopBoost;
+    LLVM_DEBUG(dbgs() << "LV: Boosting MaxInterleaveFactor by " << TinyLoopBoost
+                      << "x to " << MaxInterleaveCount
+                      << " for tiny loop (cost=" << LoopCost << ")\n");
+  }
 
   // Check if the user has overridden the max.
   if (VF.isScalar()) {

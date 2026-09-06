@@ -729,6 +729,10 @@ public:
     return 1;
   }
 
+  virtual unsigned getTinyLoopInterleaveBoost(unsigned LoopCost) const {
+    return 1;
+  }
+
   virtual InstructionCost getArithmeticInstrCost(
       unsigned Opcode, Type *Ty, TTI::TargetCostKind CostKind,
       TTI::OperandValueInfo Opd1Info, TTI::OperandValueInfo Opd2Info,
